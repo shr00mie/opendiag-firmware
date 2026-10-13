@@ -7,16 +7,21 @@ idf_component_register(SRCS main.c
                             board.c
                             button.c
                             slcan.c
+                            ediabas.c
+                            ediabas_bmwfast.c
+                            kdcan.c
                             j2534.c
                             j2534_scheduler.c
                             j2534_wire.c
                             j2534.pb.c
                             usb_cdc.c
                             ble_uart.c
+                            ble_profiles.c
                             can_bus.c
                             isotp.c
                             kline.c
                             kline_codec.c
+                            ds2_codec.c
                             bus_tx.c
                             bus_tx_worker.c
                             bus.c

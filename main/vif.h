@@ -10,7 +10,7 @@
 #include "comm_iface.h"
 
 /** Protocol grammars the firmware carries. Registered once, never removed. */
-#define VIF_MAX_FRONTENDS 4
+#define VIF_MAX_FRONTENDS 8
 
 /** Returned without an open bus claim or from the wrong owner's task. */
 #define VIF_ERR_NO_CLAIM (-3)

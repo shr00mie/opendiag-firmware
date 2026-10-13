@@ -1058,6 +1058,20 @@ TEST(the_table_can_be_walked_and_ends) {
     TEST_ASSERT_EQUAL_INT(2, (int)count);
 }
 
+
+TEST(the_front_end_table_has_room_for_five) {
+    static const vif_frontend_t extras[] = {
+        {.name = "fe_c"}, {.name = "fe_d"}, {.name = "fe_e"},
+    };
+
+    TEST_ASSERT_EQUAL_INT(ESP_OK, vif_frontend_register(&frontend_a));
+    TEST_ASSERT_EQUAL_INT(ESP_OK, vif_frontend_register(&frontend_b));
+    for (size_t i = 0; i < sizeof(extras) / sizeof(extras[0]); i++) {
+        TEST_ASSERT_EQUAL_INT(ESP_OK, vif_frontend_register(&extras[i]));
+    }
+    TEST_ASSERT_EQUAL_STRING("fe_e", vif_frontend_at(4)->name);
+}
+
 /* ------------------------------------------------------------------ *
  * Defaults and reverting
  * ------------------------------------------------------------------ */

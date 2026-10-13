@@ -12,7 +12,9 @@
 #include "button.h"
 #include "comm_iface.h"
 #include "common.h"
+#include "ediabas.h"
 #include "elm327_at.h"
+#include "kdcan.h"
 #include "j2534.h"
 #include "link.h"
 #include "nvs_flash.h"
@@ -271,6 +273,11 @@ static void button_held(void) { ble_uart_open_pairing_window(); }
  */
 static void button_held_long(void) { ble_uart_forget_bonds(); }
 
+/**
+ * "Ready" is the transport's call: an encrypted link in STRICT, any link in
+ * COMPAT. A phone that is merely connected is not reported, so one that never
+ * finishes pairing cannot hold the link against USB.
+ */
 static void ble_conn_changed(bool connected) {
     if (connected) {
         link_try_bind(g_port_ble);
@@ -297,6 +304,8 @@ static void links_setup(void) {
     elm327_register();
     slcan_register();
     j2534_register();
+    ediabas_register();
+    kdcan_register();
 
     if (vif_link_start(&elm327_frontend) != ESP_OK) {
         ESP_LOGE(TAG, "failed to start the data link");
