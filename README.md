@@ -74,8 +74,8 @@ existing ELM327 app works without being told anything.
 
 Implemented and working:
 
-- ELM327 protocols 1 (J1850 PWM), 2 (J1850 VPW), 3 (ISO 9141-2), and 6–9 (CAN 11/29-bit at
-  250k/500k)
+- ELM327 protocols 1 (J1850 PWM), 2 (J1850 VPW), 3 (ISO 9141-2), 4 (ISO 14230-4 KWP, 5-baud
+  init), 5 (ISO 14230-4 KWP, fast init), and 6–9 (CAN 11/29-bit at 250k/500k)
 - ELM327 over USB CDC port 0 and BLE, independently on each
 - SLCAN (LAWICEL) on either link, for `slcand` and ECU reflashing
 - Switching a link between the two without dropping its bus or programming voltage
