@@ -25,7 +25,9 @@ TEST(passthru_command_switches_after_reply_and_discards_pipelined_commands) {
     TEST_ASSERT_TRUE(vif_link_service());
     TEST_ASSERT_EQUAL_STRING("j2534", vif_link_frontend_name());
     elm_link_down();
-    TEST_ASSERT_EQUAL_STRING("elm327", vif_link_frontend_name());
+    /* AT VIF makes the mode sticky; disconnect rebuilds j2534, not elm327. */
+    TEST_ASSERT_EQUAL_STRING("j2534", vif_link_frontend_name());
+    TEST_ASSERT_EQUAL_STRING("j2534", vif_link_default_frontend()->name);
 }
 
 TEST(slcan_command_selects_registered_frontend) {
@@ -892,6 +894,50 @@ TEST(a_malformed_address_argument_is_rejected) {
                         "%s was accepted, got \"%s\"", cmds[i],
                         td_escape(fake_port_text(0), fake_port_len(0)));
     }
+}
+
+TEST(phase3_and_phase5_commands_are_accepted) {
+    elm_echo_off();
+
+    elm_ok("ATSP6\r");
+    elm_ok("ATC0\r");
+    elm_ok("ATC1\r");
+    elm_ok("ATCF7E8\r");
+    elm_ok("ATCM7FF\r");
+    elm_ok("ATCP18\r");
+    TEST_ASSERT_NOT_NULL(strstr(elm_ask("ATCS\r"), "RX:"));
+    elm_ok("ATCSM0\r");
+    elm_ok("ATCSM1\r");
+    elm_ok("ATCTM1\r");
+    elm_ok("ATCTM5\r");
+    elm_ok("ATV0\r");
+    elm_ok("ATV1\r");
+    elm_ok("ATSD55\r");
+    TEST_ASSERT_EQUAL_STRING("55\r" ELM_PROMPT, elm_ask("ATRD\r"));
+    elm_ok("ATCV1250\r");
+    elm_ok("ATCV0000\r");
+    TEST_ASSERT_EQUAL_STRING("\r" ELM_PROMPT, elm_ask("AT@2\r"));
+    elm_ok("AT@3ABCDEFGHIJKL\r");
+    TEST_ASSERT_EQUAL_STRING("?\r" ELM_PROMPT, elm_ask("AT@3ABCDEFGHIJKL\r"));
+}
+
+TEST(pp_and_memory_flags_are_stateful) {
+    elm_echo_off();
+
+    elm_ok("ATPP03SV64\r");
+    elm_ok("ATPP03ON\r");
+    const char *pps = elm_ask("ATPPS\r");
+    TEST_ASSERT_NOT_NULL(strstr(pps, "03:64 N\r"));
+
+    elm_ok("ATM1\r");
+    elm_ok("ATSP6\r");
+    elm_ask("ATZ\r");
+    elm_echo_off();
+    TEST_ASSERT_EQUAL_STRING("6\r" ELM_PROMPT, elm_ask("ATDPN\r"));
+    elm_ok("ATSP00\r");
+    elm_ask("ATZ\r");
+    elm_echo_off();
+    TEST_ASSERT_EQUAL_STRING("0\r" ELM_PROMPT, elm_ask("ATDPN\r"));
 }
 
 TEST(at_dp_names_the_protocol) {

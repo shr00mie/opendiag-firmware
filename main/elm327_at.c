@@ -2,6 +2,7 @@
 #include "elm327_at.h"
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -137,6 +138,53 @@ typedef struct {
      */
     bool can_show_dlc;
 
+    /**
+     * AT PB xx yy: USER1 (protocol B) options and baud divisor.
+     * rate_kbps = 500 / yy. Defaults match ELM PP 2C/2D (E0 / 04).
+     */
+    uint8_t proto_b_opts;
+    uint8_t proto_b_div;
+    /** USER2 (protocol C) defaults match PP 2E/2F (80 / 0A). */
+    uint8_t proto_c_opts;
+    uint8_t proto_c_div;
+
+    /** AT CEA / CER — ISO-TP extended addressing. */
+    bool cea_enabled;
+    uint8_t cea_tx_addr;
+    uint8_t cer_rx_addr;
+    bool cer_override;
+
+    /** AT CFC0/1 — automatic Flow Control (default on). */
+    bool cfc_enabled;
+    /** AT FC SM — 0 auto, 1 user ID+data, 2 user data. */
+    uint8_t fc_mode;
+    uint32_t fc_id;
+    bool fc_id_11bit;
+    bool fc_sh_set;
+    uint8_t fc_data[5];
+    uint8_t fc_data_len;
+    bool fc_sd_set;
+
+    /**
+     * AT CRA — receive ID filter. When inactive, ISO 15765-4 OBD ranges apply
+     * for protocols 6–9; USER1/USER2 require CRA (or accept nothing OBD-like).
+     */
+    bool can_cra_active;
+    uint32_t can_cra_id;
+    uint32_t can_cra_mask;
+    /** AT CF/CM active alongside CRA; same ID/mask matcher. */
+    bool can_cfcm_active;
+    uint32_t can_cf_id;
+    uint32_t can_cm_mask;
+    /** AT CP hh (29-bit normal-fixed priority field). */
+    uint8_t can_priority;
+    /** AT CSM0/1 and AT C0/C1. */
+    bool can_silent;
+    bool can_tx_ack;
+    /** AT V0/V1 and AT CTM1/5. */
+    bool can_var_dlc;
+    uint8_t can_timer_mult;
+
     uint32_t header_id;
     bool hex_spacing;
 
@@ -166,6 +214,18 @@ typedef struct {
     /** AT FT hh: only accept frames from this transmitter. */
     bool filter_tx;
     uint8_t tx_filter;
+    /** AT M0/M1. Kept session-local on host tests. */
+    bool memory_on;
+    /** AT SD/RD user byte and AT @2/@3 identity string state. */
+    uint8_t user_data;
+    char identifier[13];
+    bool identifier_locked;
+    /** AT CV calibration offset in millivolts (AT CV 0000 resets). */
+    int32_t cv_offset_mv;
+
+    /** AT PP state. */
+    uint8_t pp_value[256];
+    bool pp_enabled[256];
 
     /** AT IFR0..6 and AT IFR H / S, protocols 1 and 2 only. */
     elm327_ifr_mode_t ifr_mode;
@@ -257,9 +317,37 @@ typedef struct {
      * speaks, not to watch four of them fail.
      */
     bool in_search;
+
+    /**
+     * True once the CAN controller has received any frame this request.
+     *
+     * A controller acknowledges every valid frame it hears, so traffic of any
+     * kind - not only a reply to our request - proves a live CAN bus at the
+     * bit rate in use. The automatic search reads silence on the first CAN
+     * attempt as "no OBD CAN here" and tries K-Line before the other three
+     * CAN protocols, which is what a pre-CAN car such as an E46 needs.
+     */
+    bool can_rx_seen;
+    uint8_t last_obd_buf[12];
+    uint8_t last_obd_len;
 } elm327_ctx_t;
 
 static elm327_ctx_t g_elm327;
+
+typedef struct {
+    bool init;
+    bool memory_on;
+    uint8_t saved_proto;
+    bool saved_proto_valid;
+    uint8_t user_data;
+    char identifier[13];
+    bool identifier_locked;
+    int32_t cv_offset_mv;
+    uint8_t pp_value[256];
+    bool pp_enabled[256];
+} elm327_nv_t;
+
+static elm327_nv_t g_elm_nv;
 
 enum elm327_protocol {
     ELM327_PROTO_AUTO = 0,      // Automatic
@@ -281,6 +369,54 @@ enum elm327_protocol {
 
 static int elm327_set_protocol(elm327_ctx_t *e, int proto);
 static void elm327_uart_flush(elm327_ctx_t *e);
+static void elm327_print_can_frame(elm327_ctx_t *e, uint32_t id, uint8_t dlc,
+                                   const uint8_t *data);
+static bool elm327_can_is_11bit(const elm327_ctx_t *e);
+static bool elm327_can_reply_id_ok(const elm327_ctx_t *e, uint32_t id);
+
+static bool elm327_pp_supported(uint8_t pp) {
+    switch (pp) {
+    case 0x01:
+    case 0x02:
+    case 0x03:
+    case 0x04:
+    case 0x06:
+    case 0x07:
+    case 0x09:
+    case 0x16:
+    case 0x17:
+    case 0x24:
+    case 0x25:
+    case 0x26:
+    case 0x29:
+    case 0x2C:
+    case 0x2D:
+    case 0x2E:
+    case 0x2F:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void elm327_nv_init_defaults(void) {
+    if (g_elm_nv.init) {
+        return;
+    }
+    memset(&g_elm_nv, 0, sizeof(g_elm_nv));
+    g_elm_nv.init = true;
+    g_elm_nv.memory_on = false;
+    g_elm_nv.saved_proto_valid = false;
+    g_elm_nv.identifier[0] = '\0';
+    g_elm_nv.pp_value[0x06] = ELM327_TESTER_ADDRESS;
+    g_elm_nv.pp_value[0x24] = 1;
+    g_elm_nv.pp_value[0x25] = 1;
+    g_elm_nv.pp_value[0x29] = 0;
+    g_elm_nv.pp_value[0x2C] = 0xE0;
+    g_elm_nv.pp_value[0x2D] = 0x04;
+    g_elm_nv.pp_value[0x2E] = 0x80;
+    g_elm_nv.pp_value[0x2F] = 0x0A;
+}
 
 /* The K-Line helpers live down beside the transfer path they belong to, but
  * the AT command table above needs them. */
@@ -378,6 +514,7 @@ static void elm327_send_string(elm327_ctx_t *e, const char *s) {
  * flash, and came back expects to find the voltage still up.
  */
 static void elm327_load_defaults(elm327_ctx_t *e) {
+    elm327_nv_init_defaults();
     e->settings.timeout = DEFAULT_TIMEOUT_MS;
     e->settings.echo = true;
     /* Headers off is the documented power-on state - the AT command summary
@@ -388,11 +525,41 @@ static void elm327_load_defaults(elm327_ctx_t *e) {
     e->settings.show_header = 0;
     e->settings.linefeed = 0;
     e->settings.current_protocol = ELM327_PROTO_AUTO;
+    if (g_elm_nv.memory_on && g_elm_nv.saved_proto_valid) {
+        e->settings.current_protocol = g_elm_nv.saved_proto;
+    }
     e->settings.auto_search = false;
     e->settings.auto_fallback = false;
     e->settings.std_search_order = false;
     e->settings.can_auto_format = true;
     e->settings.can_show_dlc = false;
+    e->settings.proto_b_opts = 0xE0;
+    e->settings.proto_b_div = 0x04;
+    e->settings.proto_c_opts = 0x80;
+    e->settings.proto_c_div = 0x0A;
+    e->settings.cea_enabled = false;
+    e->settings.cea_tx_addr = 0;
+    e->settings.cer_rx_addr = ELM327_TESTER_ADDRESS;
+    e->settings.cer_override = false;
+    e->settings.cfc_enabled = true;
+    e->settings.fc_mode = 0;
+    e->settings.fc_id = 0;
+    e->settings.fc_id_11bit = true;
+    e->settings.fc_sh_set = false;
+    e->settings.fc_data_len = 0;
+    e->settings.fc_sd_set = false;
+    memset(e->settings.fc_data, 0, sizeof(e->settings.fc_data));
+    e->settings.can_cra_active = false;
+    e->settings.can_cra_id = 0;
+    e->settings.can_cra_mask = UINT32_MAX;
+    e->settings.can_cfcm_active = false;
+    e->settings.can_cf_id = 0;
+    e->settings.can_cm_mask = UINT32_MAX;
+    e->settings.can_priority = 0x18;
+    e->settings.can_silent = true;
+    e->settings.can_tx_ack = true;
+    e->settings.can_var_dlc = false;
+    e->settings.can_timer_mult = 1;
     e->settings.header_id = 0;
     e->settings.hex_spacing = true;
     e->settings.responses = true;
@@ -402,6 +569,16 @@ static void elm327_load_defaults(elm327_ctx_t *e) {
     e->settings.recv_address = 0;
     e->settings.filter_tx = false;
     e->settings.tx_filter = 0;
+    e->settings.memory_on = g_elm_nv.memory_on;
+    e->settings.user_data = g_elm_nv.user_data;
+    memcpy(e->settings.identifier, g_elm_nv.identifier,
+           sizeof(e->settings.identifier));
+    e->settings.identifier_locked = g_elm_nv.identifier_locked;
+    e->settings.cv_offset_mv = g_elm_nv.cv_offset_mv;
+    memcpy(e->settings.pp_value, g_elm_nv.pp_value, sizeof(e->settings.pp_value));
+    memcpy(e->settings.pp_enabled, g_elm_nv.pp_enabled,
+           sizeof(e->settings.pp_enabled));
+    e->last_obd_len = 0;
     e->settings.ifr_mode = ELM327_IFR_AUTO;
     e->settings.ifr_from_source = false;
     memset(&e->timing, 0, sizeof(e->timing));
@@ -477,11 +654,11 @@ static int at_set_programing_voltage(elm327_ctx_t *e, const char *arg) {
     return 0;
 }
 
-/** @brief Parse a two digit hex argument. Returns -1 when it is not one. */
-static int at_parse_byte(const char *arg, uint8_t *out) {
+/** @brief Parse two hex digits at @p arg (need not be NUL-terminated there). */
+static int at_parse_byte_at(const char *arg, uint8_t *out) {
     int8_t hi, lo;
 
-    if (strlen(arg) != 2) {
+    if (!arg) {
         return -1;
     }
 
@@ -493,6 +670,14 @@ static int at_parse_byte(const char *arg, uint8_t *out) {
 
     *out = (uint8_t)(hi << 4 | lo);
     return 0;
+}
+
+/** @brief Parse a two digit hex argument. Returns -1 when it is not one. */
+static int at_parse_byte(const char *arg, uint8_t *out) {
+    if (!arg || strlen(arg) != 2) {
+        return -1;
+    }
+    return at_parse_byte_at(arg, out);
 }
 
 static int at_set_header(elm327_ctx_t *e, const char *arg) {
@@ -628,6 +813,27 @@ static vif_bus_t elm327_bus_for_protocol(int proto, vif_bus_cfg_t *cfg,
         bitrate = 500000;
         header_id = 0x18DB33F1;
         break;
+    case ELM327_PROTO_CAN_USER1:
+    case ELM327_PROTO_CAN_USER2: {
+        /* Options/divisor from AT PB (B) or defaults (C). Format must be
+         * ISO 15765-4 (bits 2..0 == 001); J1939/none stay unimplemented. */
+        const elm327_settings_t *s = &g_elm327.settings;
+        uint8_t opts =
+            proto == ELM327_PROTO_CAN_USER1 ? s->proto_b_opts : s->proto_c_opts;
+        uint8_t div =
+            proto == ELM327_PROTO_CAN_USER1 ? s->proto_b_div : s->proto_c_div;
+        if ((opts & 0x07u) != 0x01u || div < 0x01u || div > 0x40u) {
+            break;
+        }
+        bus = VIF_BUS_CAN;
+        bitrate = 500000u / div;
+        if (opts & 0x80u) {
+            header_id = 0x7DF;
+        } else {
+            header_id = 0x18DB33F1;
+        }
+        break;
+    }
     default:
         break;
     }
@@ -773,9 +979,9 @@ static const char *elm327_protocol_name(uint8_t proto) {
     case ELM327_PROTO_CAN_SAE_J1939:
         return "SAE J1939 (CAN 29/250)";
     case ELM327_PROTO_CAN_USER1:
-        return "USER1 (CAN 11/125)";
+        return "USER1 CAN";
     case ELM327_PROTO_CAN_USER2:
-        return "USER2 (CAN 11/50)";
+        return "USER2 CAN";
     default:
         return "UNKNOWN";
     }
@@ -912,9 +1118,22 @@ static int elm327_parse_proto_arg(const char *arg, uint8_t *proto,
     return 0;
 }
 
-/** @brief AT SP and AT TP, which differ only in a memory this firmware has not
- * got. */
-static void elm327_select_protocol_cmd(elm327_ctx_t *e, const char *arg) {
+static void elm327_store_protocol_if_needed(elm327_ctx_t *e, uint8_t proto,
+                                            bool save) {
+    if (!save || !e->settings.memory_on) {
+        return;
+    }
+    if (proto == ELM327_PROTO_AUTO) {
+        g_elm_nv.saved_proto_valid = false;
+        return;
+    }
+    g_elm_nv.saved_proto = proto;
+    g_elm_nv.saved_proto_valid = true;
+}
+
+/** @brief AT SP and AT TP. TP never stores protocol state. */
+static void elm327_select_protocol_cmd(elm327_ctx_t *e, const char *arg,
+                                       bool save) {
     uint8_t proto;
     bool fallback;
 
@@ -938,17 +1157,119 @@ static void elm327_select_protocol_cmd(elm327_ctx_t *e, const char *arg) {
      * there and would only make AT DP claim a fallback that is the whole
      * mechanism. */
     e->settings.auto_fallback = fallback && proto != ELM327_PROTO_AUTO;
+    if (save && strcmp(arg, "00") == 0) {
+        g_elm_nv.saved_proto_valid = false;
+    } else {
+        elm327_store_protocol_if_needed(e, proto, save);
+    }
 
     elm327_send_string(e, "OK\r");
+}
+
+static int elm327_parse_can_id_mask(const char *s, uint32_t *id, uint32_t *mask,
+                                    bool *is_11bit) {
+    size_t len = strlen(s);
+    uint32_t out_id = 0;
+    uint32_t out_mask = 0;
+
+    if (len != 3 && len != 8) {
+        return -1;
+    }
+    for (size_t i = 0; i < len; i++) {
+        out_id <<= 4;
+        out_mask <<= 4;
+        if (s[i] == 'X') {
+            continue;
+        }
+        int8_t nibble = hex_char_to_int(s[i]);
+        if (nibble < 0) {
+            return -1;
+        }
+        out_id |= (uint32_t)nibble;
+        out_mask |= 0xFu;
+    }
+
+    *is_11bit = (len == 3);
+    *id = out_id;
+    *mask = out_mask;
+    return 0;
+}
+
+static int elm327_can_ensure_open(elm327_ctx_t *e) {
+    if (elm327_bus(e) != VIF_BUS_CAN) {
+        return -1;
+    }
+    if (vif_bus_is_open(VIF_OWNER_LINK, VIF_BUS_CAN)) {
+        return 0;
+    }
+    vif_bus_cfg_t cfg = {0};
+    elm327_bus_for_protocol(e->settings.current_protocol, &cfg, NULL);
+    if (vif_bus_open(VIF_OWNER_LINK, VIF_BUS_CAN, &cfg) != ESP_OK) {
+        return -1;
+    }
+    elm327_apply_bus_policy(e, VIF_BUS_CAN, e->settings.current_protocol);
+    return 0;
+}
+
+typedef enum {
+    ELM327_MON_ALL = 0,
+    ELM327_MON_RX,
+    ELM327_MON_TX,
+} elm327_mon_mode_t;
+
+static bool elm327_monitor_match(elm327_mon_mode_t mode, uint8_t arg,
+                                 uint32_t id) {
+    if (mode == ELM327_MON_ALL) {
+        return true;
+    }
+    if (id & CAN_EFF_FLAG) {
+        uint8_t src = (uint8_t)((id >> 8) & 0xFFu);
+        uint8_t dst = (uint8_t)(id & 0xFFu);
+        return mode == ELM327_MON_RX ? dst == arg : src == arg;
+    }
+    uint8_t low = (uint8_t)(id & 0xFFu);
+    return low == arg;
+}
+
+static void elm327_monitor_can(elm327_ctx_t *e, elm327_mon_mode_t mode,
+                               uint8_t arg) {
+    uint8_t stop;
+    if (elm327_can_ensure_open(e) != 0) {
+        elm327_send_string(e, "?\r");
+        return;
+    }
+
+    for (;;) {
+        if (elm327_uart_read_bytes(e, &stop, 1, 0) > 0) {
+            elm327_send_string(e, "STOPPED\r");
+            return;
+        }
+        struct can_frame rx = {0};
+        if (can_frame_recv(&rx, pdMS_TO_TICKS(5)) != 0) {
+            continue;
+        }
+        if (!elm327_can_reply_id_ok(e, rx.id)) {
+            continue;
+        }
+        if (!elm327_monitor_match(mode, arg, rx.id)) {
+            continue;
+        }
+        elm327_print_can_frame(e, rx.id, rx.dlc, rx.data);
+    }
 }
 
 static void elm327_at_command_handler(elm327_ctx_t *e, const char *cmd) {
     int rc;
 
-    if (strcmp(cmd, "VIFPASSTHRU") == 0 || strcmp(cmd, "VIFSLCAN") == 0) {
+    if (strcmp(cmd, "VIFPASSTHRU") == 0 || strcmp(cmd, "VIFSLCAN") == 0 ||
+        strcmp(cmd, "VIFEDIABAS") == 0 || strcmp(cmd, "VIFKDCAN") == 0) {
         const char *name = "j2534";
         if (strcmp(cmd, "VIFSLCAN") == 0) {
             name = "slcan";
+        } else if (strcmp(cmd, "VIFEDIABAS") == 0) {
+            name = "ediabas";
+        } else if (strcmp(cmd, "VIFKDCAN") == 0) {
+            name = "kdcan";
         }
         const vif_frontend_t *frontend = vif_frontend_find(name);
         if (!frontend) {
@@ -1012,12 +1333,10 @@ static void elm327_at_command_handler(elm327_ctx_t *e, const char *cmd) {
         ESP_LOGI(TAG, "CAN DLC display %s",
                  e->settings.can_show_dlc ? "on" : "off");
         elm327_send_string(e, "OK\r");
-    } else if (strncmp(cmd, "SP", 2) == 0 || strncmp(cmd, "TP", 2) == 0) {
-        /* "This command is identical to the SP command, except that the
-         * protocol that you select is not immediately saved in internal
-         * EEPROM memory". There is no EEPROM behind either of them here, so
-         * the two really are the same command. */
-        elm327_select_protocol_cmd(e, &cmd[2]);
+    } else if (strncmp(cmd, "SP", 2) == 0) {
+        elm327_select_protocol_cmd(e, &cmd[2], true);
+    } else if (strncmp(cmd, "TP", 2) == 0) {
+        elm327_select_protocol_cmd(e, &cmd[2], false);
     } else if (strncmp(cmd, "ST", 2) == 0) {
         uint8_t val;
 
@@ -1093,9 +1412,12 @@ static void elm327_at_command_handler(elm327_ctx_t *e, const char *cmd) {
         e->settings.linefeed = 1;
         elm327_send_string(e, "OK\r");
     } else if (strcmp(cmd, "M0") == 0) {
+        e->settings.memory_on = false;
+        g_elm_nv.memory_on = false;
         elm327_send_string(e, "OK\r");
     } else if (strcmp(cmd, "M1") == 0) {
-        // TODO: for Memory on, we support to remeber the last use protocol
+        e->settings.memory_on = true;
+        g_elm_nv.memory_on = true;
         elm327_send_string(e, "OK\r");
     } else if (strcmp(cmd, "CAF0") == 0) {
         ESP_LOGI(TAG, "CAN auto format OFF");
@@ -1105,11 +1427,235 @@ static void elm327_at_command_handler(elm327_ctx_t *e, const char *cmd) {
         ESP_LOGI(TAG, "CAN auto format ON");
         e->settings.can_auto_format = true;
         elm327_send_string(e, "OK\r");
+    } else if (strncmp(cmd, "PB", 2) == 0) {
+        uint8_t opts, div;
+        if (strlen(cmd) != 6 || at_parse_byte_at(&cmd[2], &opts) ||
+            at_parse_byte_at(&cmd[4], &div) || div < 0x01u || div > 0x40u) {
+            elm327_send_string(e, "?\r");
+        } else {
+            e->settings.proto_b_opts = opts;
+            e->settings.proto_b_div = div;
+            ESP_LOGI(TAG, "Protocol B opts=0x%02x div=0x%02x (%u kbaud)", opts,
+                     div, 500u / div);
+            elm327_send_string(e, "OK\r");
+        }
+    } else if (strcmp(cmd, "CEA") == 0) {
+        e->settings.cea_enabled = false;
+        e->settings.cer_override = false;
+        e->settings.cer_rx_addr = e->settings.tester_address;
+        ESP_LOGI(TAG, "CAN extended addressing off");
+        elm327_send_string(e, "OK\r");
+    } else if (strncmp(cmd, "CEA", 3) == 0) {
+        uint8_t addr;
+        if (at_parse_byte(&cmd[3], &addr)) {
+            elm327_send_string(e, "?\r");
+        } else {
+            e->settings.cea_enabled = true;
+            e->settings.cea_tx_addr = addr;
+            ESP_LOGI(TAG, "CAN extended address TX=0x%02x", addr);
+            elm327_send_string(e, "OK\r");
+        }
+    } else if (strncmp(cmd, "CER", 3) == 0) {
+        uint8_t addr;
+        if (at_parse_byte(&cmd[3], &addr)) {
+            elm327_send_string(e, "?\r");
+        } else {
+            e->settings.cer_override = true;
+            e->settings.cer_rx_addr = addr;
+            ESP_LOGI(TAG, "CAN extended RX address=0x%02x", addr);
+            elm327_send_string(e, "OK\r");
+        }
+    } else if (strcmp(cmd, "C0") == 0) {
+        e->settings.can_tx_ack = false;
+        elm327_send_string(e, "OK\r");
+    } else if (strcmp(cmd, "C1") == 0) {
+        e->settings.can_tx_ack = true;
+        elm327_send_string(e, "OK\r");
+    } else if (strcmp(cmd, "CFC0") == 0) {
+        e->settings.cfc_enabled = false;
+        elm327_send_string(e, "OK\r");
+    } else if (strcmp(cmd, "CFC1") == 0) {
+        e->settings.cfc_enabled = true;
+        elm327_send_string(e, "OK\r");
+    } else if (strncmp(cmd, "CF", 2) == 0) {
+        uint32_t id = 0, mask = 0;
+        bool is_11bit = false;
+        if (elm327_parse_can_id_mask(&cmd[2], &id, &mask, &is_11bit) != 0) {
+            elm327_send_string(e, "?\r");
+        } else {
+            e->settings.can_cf_id = id;
+            if (!e->settings.can_cfcm_active) {
+                e->settings.can_cm_mask =
+                    is_11bit ? (uint32_t)CAN_SFF_MASK : (uint32_t)CAN_EFF_MASK;
+            }
+            e->settings.can_cfcm_active = true;
+            elm327_send_string(e, "OK\r");
+        }
+    } else if (strncmp(cmd, "CM", 2) == 0) {
+        uint32_t id = 0, mask = 0;
+        bool is_11bit = false;
+        if (elm327_parse_can_id_mask(&cmd[2], &id, &mask, &is_11bit) != 0) {
+            elm327_send_string(e, "?\r");
+        } else {
+            e->settings.can_cm_mask = mask;
+            e->settings.can_cfcm_active = true;
+            if (!e->settings.can_cf_id) {
+                e->settings.can_cf_id = id;
+            }
+            elm327_send_string(e, "OK\r");
+        }
+    } else if (strncmp(cmd, "CP", 2) == 0) {
+        uint8_t priority = 0;
+        if (at_parse_byte(&cmd[2], &priority)) {
+            elm327_send_string(e, "?\r");
+        } else {
+            e->settings.can_priority = priority;
+            if (!elm327_can_is_11bit(e)) {
+                e->settings.header_id =
+                    (e->settings.header_id & ~0xFF000000u) |
+                    ((uint32_t)priority << 24);
+            }
+            elm327_send_string(e, "OK\r");
+        }
+    } else if (strncmp(cmd, "FCSM", 4) == 0) {
+        if (cmd[4] < '0' || cmd[4] > '2' || cmd[5] != '\0') {
+            elm327_send_string(e, "?\r");
+        } else if ((cmd[4] == '1' || cmd[4] == '2') &&
+                   (!e->settings.fc_sd_set ||
+                    (cmd[4] == '1' && !e->settings.fc_sh_set))) {
+            elm327_send_string(e, "?\r");
+        } else {
+            e->settings.fc_mode = (uint8_t)(cmd[4] - '0');
+            elm327_send_string(e, "OK\r");
+        }
+    } else if (strncmp(cmd, "FCSH", 4) == 0) {
+        size_t len = strlen(&cmd[4]);
+        uint32_t id = 0;
+        if ((len != 3 && len != 8) || hex_string_to_u32_be(&cmd[4], len, &id)) {
+            elm327_send_string(e, "?\r");
+        } else {
+            e->settings.fc_id = id;
+            e->settings.fc_id_11bit = (len == 3);
+            e->settings.fc_sh_set = true;
+            elm327_send_string(e, "OK\r");
+        }
+    } else if (strncmp(cmd, "FCSD", 4) == 0) {
+        const char *p = &cmd[4];
+        size_t n = strlen(p);
+        if (n < 2 || n > 10 || (n & 1u)) {
+            elm327_send_string(e, "?\r");
+        } else {
+            uint8_t bytes[5];
+            unsigned count = (unsigned)(n / 2);
+            unsigned i;
+            for (i = 0; i < count; i++) {
+                if (at_parse_byte_at(p + i * 2, &bytes[i])) {
+                    break;
+                }
+            }
+            if (i != count) {
+                elm327_send_string(e, "?\r");
+            } else {
+                memcpy(e->settings.fc_data, bytes, count);
+                e->settings.fc_data_len = (uint8_t)count;
+                e->settings.fc_sd_set = true;
+                elm327_send_string(e, "OK\r");
+            }
+        }
+    } else if (strcmp(cmd, "CRA") == 0) {
+        e->settings.can_cra_active = false;
+        e->settings.can_cfcm_active = false;
+        e->settings.can_cf_id = 0;
+        e->settings.can_cm_mask = UINT32_MAX;
+        elm327_send_string(e, "OK\r");
+    } else if (strncmp(cmd, "CRA", 3) == 0) {
+        uint32_t id = 0, mask = 0;
+        bool is_11bit = false;
+        if (elm327_parse_can_id_mask(&cmd[3], &id, &mask, &is_11bit) != 0) {
+            elm327_send_string(e, "?\r");
+        } else {
+            e->settings.can_cra_active = true;
+            e->settings.can_cra_id = id;
+            e->settings.can_cra_mask = mask ? mask
+                                            : (is_11bit ? (uint32_t)CAN_SFF_MASK
+                                                        : (uint32_t)CAN_EFF_MASK);
+            e->settings.can_cfcm_active = false;
+            ESP_LOGI(TAG, "CAN Rx Addr filter 0x%08" PRIx32, id);
+            elm327_send_string(e, "OK\r");
+        }
+    } else if (strcmp(cmd, "CS") == 0) {
+        bus_stats_t stats = {0};
+        (void)vif_bus_stats(VIF_BUS_CAN, &stats);
+        char out[80];
+        snprintf(out, sizeof(out), "RX:%" PRIu32 " TX:%" PRIu32
+                                   " ERR:%" PRIu32 "\r",
+                 stats.rx_msgs, stats.tx_msgs,
+                 stats.rx_bad_checksum + stats.rx_overrun + stats.tx_echo_bad +
+                     stats.tx_echo_missing);
+        elm327_send_string(e, out);
+    } else if (strcmp(cmd, "CSM0") == 0) {
+        e->settings.can_silent = false;
+        elm327_send_string(e, "OK\r");
+    } else if (strcmp(cmd, "CSM1") == 0) {
+        e->settings.can_silent = true;
+        elm327_send_string(e, "OK\r");
+    } else if (strcmp(cmd, "CTM1") == 0) {
+        e->settings.can_timer_mult = 1;
+        elm327_send_string(e, "OK\r");
+    } else if (strcmp(cmd, "CTM5") == 0) {
+        e->settings.can_timer_mult = 5;
+        elm327_send_string(e, "OK\r");
+    } else if (strcmp(cmd, "V0") == 0) {
+        e->settings.can_var_dlc = false;
+        elm327_send_string(e, "OK\r");
+    } else if (strcmp(cmd, "V1") == 0) {
+        e->settings.can_var_dlc = true;
+        elm327_send_string(e, "OK\r");
     } else if (strcmp(cmd, "RV") == 0) {
         char voltstr[8];
-        float volt = vif_vbatt_mv() / 1000.0f;
+        float volt = (vif_vbatt_mv() + e->settings.cv_offset_mv) / 1000.0f;
         snprintf(voltstr, sizeof(voltstr), "%0.1fV\r", volt);
         elm327_send_string(e, voltstr);
+    } else if (strcmp(cmd, "RD") == 0) {
+        char out[8];
+        snprintf(out, sizeof(out), "%02X\r", e->settings.user_data);
+        elm327_send_string(e, out);
+    } else if (strncmp(cmd, "SD", 2) == 0) {
+        uint8_t val = 0;
+        if (at_parse_byte(&cmd[2], &val)) {
+            elm327_send_string(e, "?\r");
+        } else {
+            e->settings.user_data = val;
+            g_elm_nv.user_data = val;
+            elm327_send_string(e, "OK\r");
+        }
+    } else if (strncmp(cmd, "CV", 2) == 0) {
+        const char *p = &cmd[2];
+        if (strlen(p) != 4 || strspn(p, "0123456789") != 4) {
+            elm327_send_string(e, "?\r");
+        } else if (strcmp(p, "0000") == 0) {
+            e->settings.cv_offset_mv = 0;
+            g_elm_nv.cv_offset_mv = 0;
+            elm327_send_string(e, "OK\r");
+        } else {
+            uint32_t raw = (uint32_t)atoi(p);
+            int32_t target_mv = (int32_t)raw * 10;
+            e->settings.cv_offset_mv = target_mv - vif_vbatt_mv();
+            g_elm_nv.cv_offset_mv = e->settings.cv_offset_mv;
+            elm327_send_string(e, "OK\r");
+        }
+    } else if (strcmp(cmd, "BD") == 0) {
+        char out[64];
+        char *w = out;
+        w += sprintf(w, "%02X ", e->last_obd_len);
+        for (unsigned i = 0; i < sizeof(e->last_obd_buf); i++) {
+            w += sprintf(w, "%02X%s", e->last_obd_buf[i], i == 11 ? "\r" : " ");
+        }
+        elm327_send_string(e, out);
+    } else if (strcmp(cmd, "FE") == 0) {
+        e->timing.watch.active = false;
+        e->search_first = 0;
+        elm327_send_string(e, "OK\r");
     } else if (strncmp(cmd, "PROGV", 5) == 0) {
         rc = at_set_programing_voltage(e, &cmd[5]);
         if (rc) {
@@ -1129,6 +1675,87 @@ static void elm327_at_command_handler(elm327_ctx_t *e, const char *cmd) {
         elm327_send_string(e, OPENDIAG_MANUFACTURE " " OPENDIAG_PRODUCT " (");
         elm327_send_string(e, desc->version);
         elm327_send_string(e, ")\r");
+    } else if (strcmp(cmd, "@2") == 0) {
+        elm327_send_string(e, e->settings.identifier);
+        elm327_send_string(e, "\r");
+    } else if (strncmp(cmd, "@3", 2) == 0) {
+        const char *id = &cmd[2];
+        if (strlen(id) != 12 || e->settings.identifier_locked) {
+            elm327_send_string(e, "?\r");
+        } else {
+            bool ok = true;
+            for (int i = 0; i < 12; i++) {
+                if ((unsigned char)id[i] < 0x21 || (unsigned char)id[i] > 0x5Fu) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) {
+                elm327_send_string(e, "?\r");
+            } else {
+                memcpy(e->settings.identifier, id, 12);
+                e->settings.identifier[12] = '\0';
+                e->settings.identifier_locked = true;
+                memcpy(g_elm_nv.identifier, e->settings.identifier, 13);
+                g_elm_nv.identifier_locked = true;
+                elm327_send_string(e, "OK\r");
+            }
+        }
+    } else if (strcmp(cmd, "PPS") == 0) {
+        char line[16];
+        for (unsigned pp = 0; pp < 256; pp++) {
+            if (!elm327_pp_supported((uint8_t)pp)) {
+                continue;
+            }
+            snprintf(line, sizeof(line), "%02X:%02X %c\r", pp,
+                     e->settings.pp_value[pp],
+                     e->settings.pp_enabled[pp] ? 'N' : 'F');
+            elm327_send_string(e, line);
+        }
+    } else if (strncmp(cmd, "PP", 2) == 0) {
+        uint8_t pp = 0, val = 0;
+        if (strlen(cmd) >= 4 && at_parse_byte_at(&cmd[2], &pp) == 0) {
+            if (strcmp(&cmd[4], "ON") == 0) {
+                if (pp == 0xFF) {
+                    for (unsigned i = 0; i < 256; i++) {
+                        if (elm327_pp_supported((uint8_t)i))
+                            e->settings.pp_enabled[i] = true;
+                    }
+                } else if (elm327_pp_supported(pp)) {
+                    e->settings.pp_enabled[pp] = true;
+                } else {
+                    elm327_send_string(e, "?\r");
+                    return;
+                }
+                memcpy(g_elm_nv.pp_enabled, e->settings.pp_enabled,
+                       sizeof(g_elm_nv.pp_enabled));
+                elm327_send_string(e, "OK\r");
+            } else if (strcmp(&cmd[4], "OFF") == 0) {
+                if (pp == 0xFF) {
+                    for (unsigned i = 0; i < 256; i++) {
+                        e->settings.pp_enabled[i] = false;
+                    }
+                } else if (elm327_pp_supported(pp)) {
+                    e->settings.pp_enabled[pp] = false;
+                } else {
+                    elm327_send_string(e, "?\r");
+                    return;
+                }
+                memcpy(g_elm_nv.pp_enabled, e->settings.pp_enabled,
+                       sizeof(g_elm_nv.pp_enabled));
+                elm327_send_string(e, "OK\r");
+            } else if (strncmp(&cmd[4], "SV", 2) == 0 &&
+                       at_parse_byte(&cmd[6], &val) == 0 &&
+                       elm327_pp_supported(pp)) {
+                e->settings.pp_value[pp] = val;
+                g_elm_nv.pp_value[pp] = val;
+                elm327_send_string(e, "OK\r");
+            } else {
+                elm327_send_string(e, "?\r");
+            }
+        } else {
+            elm327_send_string(e, "?\r");
+        }
     } else if (strcmp(cmd, "R0") == 0) {
         ESP_LOGI(TAG, "Responses off");
         e->settings.responses = false;
@@ -1253,9 +1880,9 @@ static void elm327_at_command_handler(elm327_ctx_t *e, const char *cmd) {
                  e->settings.key_word_check ? "on" : "off");
         elm327_send_string(e, "OK\r");
     } else if (strncmp(cmd, "IB", 2) == 0) {
-        /* The five rates the datasheet offers. The two above 10400 are past
-         * what ISO 14230-2 allows and exist for the manufacturer specific
-         * systems that use them anyway. */
+        /* Datasheet rates, plus 115200 for BMW-FAST-class K-Line. Rates above
+         * 10400 are past what ISO 14230-2 allows and exist for manufacturer
+         * specific systems that use them anyway. */
         uint32_t baud = 0;
 
         if (strcmp(&cmd[2], "10") == 0)
@@ -1268,6 +1895,8 @@ static void elm327_at_command_handler(elm327_ctx_t *e, const char *cmd) {
             baud = 4800;
         else if (strcmp(&cmd[2], "96") == 0)
             baud = 9600;
+        else if (strcmp(&cmd[2], "115") == 0)
+            baud = 115200;
 
         if (baud == 0) {
             elm327_send_string(e, "?\r");
@@ -1340,10 +1969,9 @@ static void elm327_at_command_handler(elm327_ctx_t *e, const char *cmd) {
     } else if (strcmp(cmd, "BI") == 0) {
         /* "allows an OBD protocol to be made active without requiring any
          * sort of initiation or handshaking to occur." Nothing goes on the
-         * wire; only our idea of the link changes. */
-        if (!elm327_is_kline(e)) {
-            elm327_send_string(e, "?\r");
-        } else {
+         * wire; only our idea of the link changes. Required for BMW CAN
+         * (USER1 + CEA) which has no OBD init handshake. */
+        if (elm327_is_kline(e)) {
             kline_variant_t v =
                 elm327_is_kwp(e) ? KLINE_VARIANT_KWP : KLINE_VARIANT_ISO9141;
 
@@ -1351,6 +1979,10 @@ static void elm327_at_command_handler(elm327_ctx_t *e, const char *cmd) {
                           &v, NULL);
             elm327_kline_apply_wakeup(e);
             elm327_send_string(e, "OK\r");
+        } else if (vif_bus_is_open(VIF_OWNER_LINK, VIF_BUS_CAN)) {
+            elm327_send_string(e, "OK\r");
+        } else {
+            elm327_send_string(e, "?\r");
         }
     } else if (strcmp(cmd, "IA") == 0) {
         /* A protocol is active once a handshake succeeded or AT BI said so.
@@ -1361,6 +1993,40 @@ static void elm327_at_command_handler(elm327_ctx_t *e, const char *cmd) {
                           : vif_bus_is_open(VIF_OWNER_LINK, elm327_bus(e));
 
         elm327_send_string(e, active ? "Y\r" : "N\r");
+    } else if (strcmp(cmd, "RTR") == 0) {
+        struct can_frame tx = {0};
+        if (elm327_can_ensure_open(e) != 0) {
+            elm327_send_string(e, "?\r");
+        } else {
+            tx.id = e->settings.header_id;
+            if (!elm327_can_is_11bit(e)) {
+                tx.id |= CAN_EFF_FLAG;
+            }
+            tx.id |= CAN_RTR_FLAG;
+            tx.dlc = e->settings.can_var_dlc ? 0 : 8;
+            if ((e->settings.can_tx_ack ? can_frame_send_confirmed(&tx)
+                                        : can_frame_send(&tx)) == 0) {
+                elm327_send_string(e, "OK\r");
+            } else {
+                elm327_send_string(e, "?\r");
+            }
+        }
+    } else if (strcmp(cmd, "MA") == 0) {
+        elm327_monitor_can(e, ELM327_MON_ALL, 0);
+    } else if (strncmp(cmd, "MR", 2) == 0) {
+        uint8_t addr = 0;
+        if (at_parse_byte(&cmd[2], &addr)) {
+            elm327_send_string(e, "?\r");
+        } else {
+            elm327_monitor_can(e, ELM327_MON_RX, addr);
+        }
+    } else if (strncmp(cmd, "MT", 2) == 0) {
+        uint8_t addr = 0;
+        if (at_parse_byte(&cmd[2], &addr)) {
+            elm327_send_string(e, "?\r");
+        } else {
+            elm327_monitor_can(e, ELM327_MON_TX, addr);
+        }
     } else if (strcmp(cmd, "AL") == 0 || strcmp(cmd, "NL") == 0) {
         /* Long message support is decided by the frame cap of the bus in use,
          * so there is nothing to switch; accepted so a client that asks is
@@ -1379,6 +2045,7 @@ static void read_all_can(elm327_ctx_t *e) {
         int ret = can_frame_recv(&frame, 0);
         if (ret != 0)
             return;
+        e->can_rx_seen = true;
     }
 }
 
@@ -1526,6 +2193,9 @@ static void elm327_print_can_frame(elm327_ctx_t *e, uint32_t id, uint8_t dlc,
 
 static uint32_t elm327_timeout_limit(const elm327_ctx_t *e) {
     uint32_t limit = (uint32_t)e->settings.timeout;
+    if (elm327_bus(e) == VIF_BUS_CAN && e->settings.can_timer_mult == 5) {
+        limit *= 5u;
+    }
     if (e->in_search && limit < ELM327_SEARCH_MIN_MS)
         limit = ELM327_SEARCH_MIN_MS;
     return limit;
@@ -1695,11 +2365,40 @@ static void elm327_timing_finish(elm327_ctx_t *e) {
         elm327_timing_backoff(e);
 }
 
-/** @brief True for the two ISO 15765-4 protocols that use 11 bit identifiers.
- */
+/** @brief True when the active CAN protocol uses 11-bit identifiers. */
 static bool elm327_can_is_11bit(const elm327_ctx_t *e) {
-    return e->settings.current_protocol == ELM327_PROTO_CAN_11BIT_250K ||
-           e->settings.current_protocol == ELM327_PROTO_CAN_11BIT_500K;
+    uint8_t p = e->settings.current_protocol;
+
+    if (p == ELM327_PROTO_CAN_11BIT_250K || p == ELM327_PROTO_CAN_11BIT_500K) {
+        return true;
+    }
+    if (p == ELM327_PROTO_CAN_USER1) {
+        return (e->settings.proto_b_opts & 0x80u) != 0;
+    }
+    if (p == ELM327_PROTO_CAN_USER2) {
+        return (e->settings.proto_c_opts & 0x80u) != 0;
+    }
+    return false;
+}
+
+static bool elm327_can_is_user(const elm327_ctx_t *e) {
+    return e->settings.current_protocol == ELM327_PROTO_CAN_USER1 ||
+           e->settings.current_protocol == ELM327_PROTO_CAN_USER2;
+}
+
+static uint8_t elm327_cea_rx_addr(const elm327_ctx_t *e) {
+    return e->settings.cer_override ? e->settings.cer_rx_addr
+                                    : e->settings.tester_address;
+}
+
+static void elm327_isotp_apply_cea(const elm327_ctx_t *e,
+                                   isotp_config_t *config) {
+    if (!e->settings.cea_enabled) {
+        return;
+    }
+    config->extended_address = true;
+    config->tx_address = e->settings.cea_tx_addr;
+    config->rx_address = elm327_cea_rx_addr(e);
 }
 
 #define ELM327_CAN_PRIORITY_MASK 0x1C000000u
@@ -1730,6 +2429,33 @@ static bool elm327_can_reply_id_ok(const elm327_ctx_t *e, uint32_t id) {
         return false;
     }
 
+    if (e->settings.can_cra_active) {
+        uint32_t want = e->settings.can_cra_id;
+        uint32_t mask = e->settings.can_cra_mask;
+        if (elm327_can_is_11bit(e)) {
+            return !extended &&
+                   ((id ^ want) & mask & CAN_SFF_MASK) == 0;
+        }
+        return extended &&
+               ((id ^ want) & mask & CAN_EFF_MASK) == 0;
+    }
+
+    if (e->settings.can_cfcm_active) {
+        uint32_t want = e->settings.can_cf_id;
+        uint32_t mask = e->settings.can_cm_mask;
+        if (elm327_can_is_11bit(e)) {
+            return !extended &&
+                   ((id ^ want) & mask & CAN_SFF_MASK) == 0;
+        }
+        return extended &&
+               ((id ^ want) & mask & CAN_EFF_MASK) == 0;
+    }
+
+    /* USER1/USER2 have no legislated OBD reply range without CRA. */
+    if (elm327_can_is_user(e)) {
+        return false;
+    }
+
     if (elm327_can_is_11bit(e)) {
         return !extended && (id & 0x7F8u) == 0x7E8u;
     }
@@ -1752,6 +2478,24 @@ static bool elm327_can_reply_id_ok(const elm327_ctx_t *e, uint32_t id) {
  */
 static uint32_t elm327_can_flow_control_id(const elm327_ctx_t *e,
                                            uint32_t reply_id) {
+    /* FC mode 1: fully user-defined header. */
+    if (e->settings.fc_mode == 1 && e->settings.fc_sh_set) {
+        uint32_t id = e->settings.fc_id;
+        if (!e->settings.fc_id_11bit) {
+            id |= CAN_EFF_FLAG;
+        }
+        return id;
+    }
+
+    if (elm327_can_is_user(e) || e->settings.can_cra_active) {
+        /* Physical reply: FC goes back on the request ID (SH / CRA pair). */
+        uint32_t id = e->settings.header_id;
+        if (!elm327_can_is_11bit(e)) {
+            id |= CAN_EFF_FLAG;
+        }
+        return id;
+    }
+
     if (elm327_can_is_11bit(e)) {
         return (reply_id & CAN_SFF_MASK) - 8u;
     }
@@ -1763,6 +2507,8 @@ static int elm327_can_protocol_xfer(elm327_ctx_t *e, const uint8_t *frame,
                                     size_t len, int num_frame) {
     int ret;
     struct can_frame tx_frame = {0};
+
+    e->can_rx_seen = false;
 
     if (!vif_bus_is_open(VIF_OWNER_LINK, VIF_BUS_CAN)) {
         vif_bus_cfg_t cfg = {0};
@@ -1782,28 +2528,39 @@ static int elm327_can_protocol_xfer(elm327_ctx_t *e, const uint8_t *frame,
                          ? tx_frame.id == 0x7DF
                          : (tx_frame.id & address_mask) == 0x00DB33F1;
 
-    // Set extended ID flag for 29 bit ID protocols
-    if (e->settings.current_protocol == ELM327_PROTO_CAN_29BIT_250K ||
-        e->settings.current_protocol == ELM327_PROTO_CAN_29BIT_500K ||
-        e->settings.current_protocol == ELM327_PROTO_CAN_SAE_J1939) {
+    /* Set extended ID flag for 29 bit ID protocols (incl. USER 29-bit). */
+    if (!elm327_can_is_11bit(e) &&
+        e->settings.current_protocol != ELM327_PROTO_AUTO) {
         tx_frame.id |= CAN_EFF_FLAG;
     }
 
     if (e->settings.can_auto_format) {
-        if (len > sizeof(tx_frame.data) - 1) {
+        size_t ea = e->settings.cea_enabled ? 1u : 0u;
+        if (len + ea > sizeof(tx_frame.data) - 1) {
             ESP_LOGE(TAG, "%u bytes do not fit a formatted frame; try AT CAF0",
                      (unsigned)len);
             return -2;
         }
 
         isotp_config_t config = isotp_config_default(tx_frame.id, tx_frame.id);
-        config.functional = multicast;
-        config.pad = e->settings.current_protocol != ELM327_PROTO_CAN_SAE_J1939;
+        config.functional = multicast && !e->settings.cea_enabled;
+        config.pad = e->settings.current_protocol != ELM327_PROTO_CAN_SAE_J1939 &&
+                     !e->settings.can_var_dlc;
+        elm327_isotp_apply_cea(e, &config);
         isotp_tx_t transport;
         if (isotp_tx_init(&transport, &config) < 0 ||
             isotp_tx_start(&transport, frame, len, 0) < 0 ||
             isotp_tx_next(&transport, &tx_frame, 0) != ISOTP_FRAME)
             return -2;
+    } else if (e->settings.cea_enabled) {
+        if (len + 1u > sizeof(tx_frame.data)) {
+            ESP_LOGE(TAG, "%u bytes do not fit a CAN frame with CEA",
+                     (unsigned)len);
+            return -2;
+        }
+        tx_frame.data[0] = e->settings.cea_tx_addr;
+        memcpy(&tx_frame.data[1], frame, len);
+        tx_frame.dlc = (uint8_t)(len + 1u);
     } else {
         if (len > sizeof(tx_frame.data)) {
             ESP_LOGE(TAG, "%u bytes do not fit a CAN frame", (unsigned)len);
@@ -1819,7 +2576,8 @@ static int elm327_can_protocol_xfer(elm327_ctx_t *e, const uint8_t *frame,
      * these protocols. SAE J1939 is the one exception - its frames
      * are genuinely variable length.
      */
-    if (e->settings.current_protocol != ELM327_PROTO_CAN_SAE_J1939) {
+    if (e->settings.current_protocol != ELM327_PROTO_CAN_SAE_J1939 &&
+        !e->settings.can_var_dlc) {
         tx_frame.dlc = sizeof(tx_frame.data);
     }
 
@@ -1875,18 +2633,21 @@ static int elm327_can_protocol_xfer(elm327_ctx_t *e, const uint8_t *frame,
         struct can_frame rx;
         TickType_t ticks = pdMS_TO_TICKS((wait_us + 999u) / 1000u);
         ret = can_frame_recv(&rx, ticks ? ticks : 1);
+        if (!ret)
+            e->can_rx_seen = true;
         if (ret || !rx.dlc || rx.dlc > 8 || !elm327_can_reply_id_ok(e, rx.id))
             continue;
         now = (uint32_t)Timer_elapsed_ms(&since_request) * 1000u;
 
-        if (!multicast &&
+        if (!multicast && !elm327_can_is_user(e) &&
+            !e->settings.can_cra_active &&
             ((elm327_can_flow_control_id(e, rx.id) ^ tx_frame.id) &
              address_mask))
             continue;
 
         /* Raw clients use CAF0 to conduct their own outgoing FC exchange. */
         if (!e->settings.can_auto_format && rx.dlc >= 3 &&
-            rx.data[0] >> 4 == 3) {
+            rx.data[e->settings.cea_enabled ? 1u : 0u] >> 4 == 3) {
             elm327_print_can_frame(e, rx.id, rx.dlc, rx.data);
             return 0;
         }
@@ -1906,6 +2667,18 @@ static int elm327_can_protocol_xfer(elm327_ctx_t *e, const uint8_t *frame,
             isotp_config_t config = isotp_config_default(
                 elm327_can_flow_control_id(e, rx.id), rx.id);
             config.rx_mask = address_mask;
+            config.pad =
+                e->settings.current_protocol != ELM327_PROTO_CAN_SAE_J1939;
+            elm327_isotp_apply_cea(e, &config);
+            /* FC mode 2: keep auto ID, apply user BS/STmin from FC SD. */
+            if (e->settings.fc_mode == 2 && e->settings.fc_sd_set &&
+                e->settings.fc_data_len >= 3) {
+                unsigned off = e->settings.cea_enabled ? 1u : 0u;
+                if (e->settings.fc_data_len > off + 2) {
+                    config.block_size = e->settings.fc_data[off + 1];
+                    config.stmin = e->settings.fc_data[off + 2];
+                }
+            }
             isotp_rx_init(stream, &config, NULL, ISOTP_MAX_PAYLOAD);
         }
         isotp_segment_t segment;
@@ -1921,10 +2694,22 @@ static int elm327_can_protocol_xfer(elm327_ctx_t *e, const uint8_t *frame,
         int fc_result = isotp_rx_flow_control(stream, &fc, now);
         if (fc_result < 0)
             goto fail;
-        if (fc_result == ISOTP_FRAME) {
+        if (fc_result == ISOTP_FRAME && e->settings.cfc_enabled) {
+            if (e->settings.fc_mode == 1 && e->settings.fc_sh_set &&
+                e->settings.fc_sd_set) {
+                memset(&fc, 0, sizeof(fc));
+                fc.id = elm327_can_flow_control_id(e, rx.id);
+                memset(fc.data, 0, sizeof(fc.data));
+                memcpy(fc.data, e->settings.fc_data, e->settings.fc_data_len);
+                fc.dlc = 8;
+            }
             int sent = can_frame_send_confirmed(&fc);
             now = (uint32_t)Timer_elapsed_ms(&since_request) * 1000u;
             if (isotp_rx_confirm(stream, sent == 0, now) < 0)
+                goto fail;
+        } else if (fc_result == ISOTP_FRAME && !e->settings.cfc_enabled) {
+            now = (uint32_t)Timer_elapsed_ms(&since_request) * 1000u;
+            if (isotp_rx_confirm(stream, true, now) < 0)
                 goto fail;
         }
         uint8_t display_dlc = rx.dlc;
@@ -2790,6 +3575,74 @@ static int elm327_search_attempt(elm327_ctx_t *e, uint8_t proto, uint8_t *prev,
     return elm327_try_protocol(e, proto, frame, len, num_frame);
 }
 
+/** @brief True for the four ISO 15765-4 protocols a search tries. */
+static bool elm327_is_obd_can(uint8_t proto) {
+    return proto >= ELM327_PROTO_CAN_11BIT_500K &&
+           proto <= ELM327_PROTO_CAN_29BIT_250K;
+}
+
+/** @brief What a search remembers between attempts. */
+typedef struct {
+    uint8_t prev;      /**< Protocol of the previous attempt. */
+    uint16_t tried;    /**< Bit n set: protocol n has been attempted. */
+    bool can_traffic;  /**< Some CAN attempt heard any frame at all. */
+    bool kline_detour; /**< The early K-Line pass has been made (or is moot). */
+} elm327_search_state_t;
+
+static int elm327_search_step(elm327_ctx_t *e, elm327_search_state_t *s,
+                              uint8_t proto, const uint8_t *frame, size_t len,
+                              int num_frame) {
+    s->tried |= (uint16_t)(1u << proto);
+    e->can_rx_seen = false;
+    int ret = elm327_search_attempt(e, proto, &s->prev, frame, len, num_frame);
+    if (elm327_is_obd_can(proto) && e->can_rx_seen) {
+        s->can_traffic = true;
+    }
+    return ret;
+}
+
+/**
+ * @brief Try K-Line now if the CAN attempt that just failed heard nothing.
+ *
+ * Not one frame on the wire - not even somebody else's - means there is no
+ * CAN bus here at this bit rate, and the usual reason is a car that has none:
+ * an E46 or any other pre-2008 K-Line vehicle. Walking the other three CAN
+ * protocols first is three more bring-ups, each ending in a bus-off recovery
+ * because nothing acknowledges the frame, and only then reaching the protocol
+ * that would have answered. So the K-Line protocols go next, and the rest of
+ * CAN follows them rather than being dropped: a 250 kbaud or 29 bit bus
+ * looks exactly this silent to a controller set to 500 kbaud.
+ *
+ * Done at most once per search, and not at all in the J1978 order, which
+ * already has K-Line ahead of CAN.
+ *
+ * @return >= 0 if a K-Line protocol answered, otherwise < 0.
+ */
+static int elm327_search_kline_detour(elm327_ctx_t *e,
+                                      elm327_search_state_t *s,
+                                      uint8_t failed, const uint8_t *frame,
+                                      size_t len, int num_frame) {
+    static const uint8_t kline[] = {ELM327_PROTO_ISO9141,
+                                    ELM327_PROTO_ISO14230_KWP_FAST};
+    int ret = -1;
+
+    if (s->kline_detour || !elm327_is_obd_can(failed) || s->can_traffic) {
+        return ret;
+    }
+
+    s->kline_detour = true;
+    for (size_t i = 0; i < sizeof(kline); i++) {
+        if (s->tried & (1u << kline[i])) {
+            continue;
+        }
+        ret = elm327_search_step(e, s, kline[i], frame, len, num_frame);
+        if (ret >= 0) {
+            break;
+        }
+    }
+    return ret;
+}
+
 /**
  * @brief Find the protocol this vehicle speaks, by trying each in turn.
  *
@@ -2799,6 +3652,10 @@ static int elm327_search_attempt(elm327_ctx_t *e, uint8_t proto, uint8_t *prev,
  * what a vehicle built this century answers to, and the 5 baud handshake is
  * left as late as possible because it alone costs two and a half seconds
  * whether it works or not.
+ *
+ * The exception is a CAN attempt that hears nothing at all: that is a car
+ * without OBD CAN, so K-Line (3, then 5) is tried before the remaining CAN
+ * protocols. See elm327_search_kline_detour().
  *
  * Ahead of all of them comes whatever AT SP 0 was holding when it was asked
  * to go automatic. A client that has just been talking to the vehicle and
@@ -2857,13 +3714,21 @@ static int elm327_search_protocol_xfer(elm327_ctx_t *e, const uint8_t *frame,
     /* The protocol the last attempt used, which is what says whether the next
      * one needs the J1850 recovery pause. @p skip counts: it was tried, on
      * this bus, immediately before this search started. */
-    uint8_t prev = skip;
+    elm327_search_state_t state = {
+        .prev = skip,
+        .tried = (uint16_t)(1u << skip),
+        .kline_detour = e->settings.std_search_order,
+    };
     int ret = -1;
 
     e->in_search = true;
 
     if (first != ELM327_PROTO_AUTO) {
-        ret = elm327_search_attempt(e, first, &prev, frame, len, num_frame);
+        ret = elm327_search_step(e, &state, first, frame, len, num_frame);
+        if (ret < 0) {
+            ret = elm327_search_kline_detour(e, &state, first, frame, len,
+                                             num_frame);
+        }
         if (ret >= 0) {
             ret = 0;
             goto done;
@@ -2871,11 +3736,15 @@ static int elm327_search_protocol_xfer(elm327_ctx_t *e, const uint8_t *frame,
     }
 
     for (size_t i = 0; i < order_len; i++) {
-        if (order[i] == first || order[i] == skip) {
+        if (state.tried & (1u << order[i])) {
             continue; /* already tried, and it did not answer */
         }
 
-        ret = elm327_search_attempt(e, order[i], &prev, frame, len, num_frame);
+        ret = elm327_search_step(e, &state, order[i], frame, len, num_frame);
+        if (ret < 0) {
+            ret = elm327_search_kline_detour(e, &state, order[i], frame, len,
+                                             num_frame);
+        }
         if (ret >= 0) {
             ret = 0;
             goto done;
@@ -2952,6 +3821,11 @@ static void elm327_parse_command(elm327_ctx_t *e, const char *cmd) {
                      frame_len);
             elm327_send_string(e, "?\r");
         } else {
+        memset(e->last_obd_buf, 0, sizeof(e->last_obd_buf));
+        e->last_obd_len = frame_len > (int)sizeof(e->last_obd_buf)
+                              ? (uint8_t)sizeof(e->last_obd_buf)
+                              : (uint8_t)frame_len;
+        memcpy(e->last_obd_buf, frame, e->last_obd_len);
             rc = -2;
 
             if (e->settings.current_protocol == 0) {
@@ -2970,14 +3844,7 @@ static void elm327_parse_command(elm327_ctx_t *e, const char *cmd) {
                 rc = elm327_j1850_vpw_xfer(e, frame, frame_len, num_frame);
             } else if (elm327_is_kline(e)) {
                 rc = elm327_kline_xfer(e, frame, frame_len, num_frame);
-            } else if (e->settings.current_protocol ==
-                           ELM327_PROTO_CAN_29BIT_500K ||
-                       e->settings.current_protocol ==
-                           ELM327_PROTO_CAN_29BIT_250K ||
-                       e->settings.current_protocol ==
-                           ELM327_PROTO_CAN_11BIT_500K ||
-                       e->settings.current_protocol ==
-                           ELM327_PROTO_CAN_11BIT_250K) {
+            } else if (elm327_bus(e) == VIF_BUS_CAN) {
                 rc = elm327_can_protocol_xfer(e, frame, frame_len, num_frame);
             }
 

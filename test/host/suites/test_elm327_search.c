@@ -119,7 +119,9 @@ TEST(a_search_reaches_can_29_bit_when_the_11_bit_protocols_are_silent) {
 
     TEST_ASSERT_EQUAL_STRING("A7\r" ELM_PROMPT, elm_ask("ATDPN\r"));
     TEST_ASSERT_EQUAL_INT(2, fake_can_setup_count());
-    TEST_ASSERT_EQUAL_INT(0, fake_bus_setup_count(FAKE_BUS_KLINE));
+    /* Protocol 6 was silent, so K-Line got its one early look in between
+     * rather than being left until the end; it does not answer here. */
+    TEST_ASSERT_EQUAL_INT(1, fake_bus_setup_count(FAKE_BUS_KLINE));
 }
 
 TEST(a_search_reaches_the_250_kbaud_protocols) {
@@ -151,6 +153,81 @@ TEST(a_search_falls_through_to_kline_when_can_is_silent) {
     TEST_ASSERT_FALSE(fake_can_is_up());
     TEST_ASSERT_TRUE(fake_bus_is_up(FAKE_BUS_KLINE));
     TEST_ASSERT_EQUAL_INT(0, fake_bus_setup_count(FAKE_BUS_J1850_PWM));
+}
+
+TEST(a_silent_can_attempt_goes_to_kline_before_the_other_can_protocols) {
+    elm_echo_off();
+    elm_ok("ATH1\r");
+    fake_bus_stage_response(FAKE_BUS_KLINE, bus_reply, sizeof(bus_reply), 5);
+
+    TEST_ASSERT_EQUAL_STRING(SEARCHING
+                             "48 6B 10 41 00 BE 3F B8 13 C4 \r" ELM_PROMPT,
+                             elm_ask("0100\r"));
+
+    /* An E46-class car: protocol 6 hears nothing, so protocols 7 to 9 are not
+     * walked before K-Line - one CAN bring-up, not four. */
+    TEST_ASSERT_EQUAL_INT(1, fake_can_setup_count());
+    TEST_ASSERT_EQUAL_STRING("A3\r" ELM_PROMPT, elm_ask("ATDPN\r"));
+    TEST_ASSERT_EQUAL_INT(0, fake_bus_setup_count(FAKE_BUS_J1850_PWM));
+}
+
+TEST(a_failed_can_transmit_also_goes_to_kline_first) {
+    elm_echo_off();
+    elm_ok("ATH1\r");
+    fake_can_fail_next_send();
+    fake_bus_stage_response(FAKE_BUS_KLINE, bus_reply, sizeof(bus_reply), 5);
+
+    TEST_ASSERT_EQUAL_STRING(SEARCHING
+                             "48 6B 10 41 00 BE 3F B8 13 C4 \r" ELM_PROMPT,
+                             elm_ask("0100\r"));
+    TEST_ASSERT_EQUAL_INT(1, fake_can_setup_count());
+    TEST_ASSERT_EQUAL_STRING("A3\r" ELM_PROMPT, elm_ask("ATDPN\r"));
+}
+
+TEST(the_other_can_protocols_still_follow_a_silent_kline) {
+    elm_echo_off();
+    elm_ok("ATH1\r");
+
+    /* Protocol 8's request is the third out. K-Line is tried (and fails)
+     * between protocol 6 and protocol 7, but CAN is not given up on. */
+    fake_can_stage_response_at(CAN_11BIT_REPLY_ID, 8, can_reply, 5, 3);
+
+    TEST_ASSERT_EQUAL_STRING(SEARCHING
+                             "7E8 06 41 00 BE 3F B8 13 00 \r" ELM_PROMPT,
+                             elm_ask("0100\r"));
+    TEST_ASSERT_EQUAL_STRING("A8\r" ELM_PROMPT, elm_ask("ATDPN\r"));
+    TEST_ASSERT_EQUAL_INT(1, fake_bus_setup_count(FAKE_BUS_KLINE));
+    TEST_ASSERT_EQUAL_INT(250000, fake_can_last_baud());
+}
+
+TEST(can_traffic_keeps_the_search_on_can_ahead_of_kline) {
+    static const uint8_t other[8] = {0x01, 0x02, 0x03, 0x04,
+                                     0x05, 0x06, 0x07, 0x08};
+
+    elm_echo_off();
+    elm_ok("ATH1\r");
+
+    /* Somebody else's frame, not a reply: it proves a live CAN bus at 500
+     * kbaud, so a K-Line attempt would be a wrong turn. */
+    fake_can_stage_response(0x123, 8, other, 5);
+    fake_can_stage_response_at(CAN_29BIT_REPLY_ID, 8, can_reply, 5, 2);
+
+    TEST_ASSERT_EQUAL_STRING(SEARCHING
+                             "18DAF110 06 41 00 BE 3F B8 13 00 \r" ELM_PROMPT,
+                             elm_ask("0100\r"));
+    TEST_ASSERT_EQUAL_STRING("A7\r" ELM_PROMPT, elm_ask("ATDPN\r"));
+    TEST_ASSERT_EQUAL_INT(0, fake_bus_setup_count(FAKE_BUS_KLINE));
+}
+
+TEST(the_j1978_order_is_not_given_a_second_kline_pass) {
+    elm_echo_off();
+    elm_ok("ATSS\r");
+
+    elm_ask("0100\r");
+
+    /* K-Line is already ahead of CAN here, so each is tried exactly once. */
+    TEST_ASSERT_EQUAL_INT(1, fake_bus_setup_count(FAKE_BUS_KLINE));
+    TEST_ASSERT_EQUAL_INT(CAN_PROTOCOLS_IN_A_SEARCH, fake_can_setup_count());
 }
 
 TEST(a_search_falls_through_to_j1850_pwm) {

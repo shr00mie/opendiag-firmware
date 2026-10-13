@@ -1177,3 +1177,119 @@ TEST(failed_flow_control_keeps_can_open_for_the_next_request) {
     TEST_ASSERT_EQUAL_INT(teardowns, fake_can_teardown_count());
     TEST_ASSERT_EQUAL_HEX32(CAN_EFF_FLAG | 0x0CDA10F1, fake_can_sent(1)->id);
 }
+
+/* ---- USER1 / BMW extended addressing (Phases 1–2) ---- */
+
+TEST(user1_pb_opens_can_at_500k) {
+    elm_echo_off();
+    elm_ok("ATPBC101\r");
+    elm_ok("ATSPB\r");
+    TEST_ASSERT_EQUAL_INT(500000, fake_can_last_baud());
+    TEST_ASSERT_TRUE(fake_can_is_up());
+    TEST_ASSERT_EQUAL_STRING("B\r" ELM_PROMPT, elm_ask("ATDPN\r"));
+}
+
+TEST(user1_pb_rejects_bad_divisor) {
+    elm_echo_off();
+    TEST_ASSERT_EQUAL_STRING("?\r" ELM_PROMPT, elm_ask("ATPBC100\r"));
+}
+
+TEST(bmw_cea_puts_extended_address_on_tx) {
+    elm_echo_off();
+    elm_ok("ATPBC101\r");
+    elm_ok("ATSPB\r");
+    elm_ok("ATBI\r");
+    elm_ok("ATSH6F1\r");
+    elm_ok("ATCRA640\r");
+    elm_ok("ATCEA40\r");
+    elm_ok("ATH1\r");
+
+    /* ECU 0x640 reply: EA=tester F1, PCI SF len 3, 62 F1 50 */
+    static const uint8_t reply[8] = {0xF1, 0x03, 0x62, 0xF1, 0x50, 0x00, 0x00,
+                                     0x00};
+    fake_can_stage_response(0x640, 8, reply, 1);
+
+    const char *out = elm_ask("22F150\r");
+    TEST_ASSERT_EQUAL_INT(1, fake_can_sent_count());
+    const struct can_frame *tx = fake_can_sent(0);
+    TEST_ASSERT_EQUAL_HEX32(0x6F1, tx->id);
+    TEST_ASSERT_EQUAL_INT(0x40, tx->data[0]); /* CEA */
+    TEST_ASSERT_EQUAL_INT(0x03, tx->data[1]); /* PCI SF */
+    TEST_ASSERT_EQUAL_INT(0x22, tx->data[2]);
+    TEST_ASSERT_EQUAL_INT(0xF1, tx->data[3]);
+    TEST_ASSERT_EQUAL_INT(0x50, tx->data[4]);
+    TEST_ASSERT_NOT_NULL(strstr(out, "640"));
+}
+
+TEST(bmw_fc_mode1_sends_custom_flow_control) {
+    elm_echo_off();
+    elm_ok("ATPBC101\r");
+    elm_ok("ATSPB\r");
+    elm_ok("ATBI\r");
+    elm_ok("ATSH6F1\r");
+    elm_ok("ATFCSH6F1\r");
+    elm_ok("ATFCSD4030FF32\r");
+    elm_ok("ATFCSM1\r");
+    elm_ok("ATCRA640\r");
+    elm_ok("ATCEA40\r");
+    elm_ok("ATH1\r");
+
+    /* First frame: EA F1, PCI 10, len, then UDS */
+    static const uint8_t ff[8] = {0xF1, 0x10, 0x0A, 0x62, 0xF1, 0x50, 0x01,
+                                  0x02};
+    static const uint8_t cf[8] = {0xF1, 0x21, 0x03, 0x04, 0x05, 0x06, 0x07,
+                                  0x08};
+    fake_can_stage_response(0x640, 8, ff, 1);
+    fake_can_stage_response_at(0x640, 8, cf, 1, 2);
+
+    const char *out = elm_ask("22F150\r");
+    TEST_ASSERT_NULL(strchr(out, '?'));
+    TEST_ASSERT_TRUE(fake_can_sent_count() >= 2);
+    const struct can_frame *fc = fake_can_sent(1);
+    TEST_ASSERT_EQUAL_HEX32(0x6F1, fc->id);
+    TEST_ASSERT_EQUAL_INT(0x40, fc->data[0]);
+    TEST_ASSERT_EQUAL_INT(0x30, fc->data[1]);
+    TEST_ASSERT_EQUAL_INT(0xFF, fc->data[2]);
+    TEST_ASSERT_EQUAL_INT(0x32, fc->data[3]);
+}
+
+TEST(fcsm1_without_fcsd_is_refused) {
+    elm_echo_off();
+    elm_ok("ATFCSH6F1\r");
+    TEST_ASSERT_EQUAL_STRING("?\r" ELM_PROMPT, elm_ask("ATFCSM1\r"));
+}
+
+TEST(rtr_sends_a_remote_frame) {
+    on_can_11bit();
+
+    elm_ok("ATRTR\r");
+
+    const struct can_frame *tx = fake_can_sent(0);
+    TEST_ASSERT_NOT_NULL(tx);
+    TEST_ASSERT_EQUAL_HEX32(0x7DF | CAN_RTR_FLAG, tx->id);
+    TEST_ASSERT_EQUAL_INT(8, tx->dlc);
+}
+
+TEST(v1_keeps_can_requests_at_variable_dlc) {
+    on_can_11bit();
+    elm_ok("ATV1\r");
+
+    elm_ask("0100\r");
+
+    const struct can_frame *tx = fake_can_sent(0);
+    TEST_ASSERT_NOT_NULL(tx);
+    TEST_ASSERT_EQUAL_INT(3, tx->dlc);
+    TEST_ASSERT_EQUAL_MEM("\x02\x01\x00", tx->data, 3);
+}
+
+TEST(cp_changes_the_normal_fixed_priority_bits) {
+    on_can_29bit();
+    elm_ok("ATSH18DB33F1\r");
+    elm_ok("ATCP0C\r");
+
+    elm_ask("0100\r");
+
+    const struct can_frame *tx = fake_can_sent(0);
+    TEST_ASSERT_NOT_NULL(tx);
+    TEST_ASSERT_EQUAL_HEX32((0x0CDB33F1 | CAN_EFF_FLAG), tx->id);
+}
