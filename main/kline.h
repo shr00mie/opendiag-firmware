@@ -38,8 +38,19 @@
  *
  *  - bus_link_t::variant holds a kline_variant_t.
  *  - BUS_IOCTL_ASSUME_LINK takes a pointer to one.
- *  - BUS_P_DATA_RATE accepts 1200 to 15625. ISO 14230-2 clause 5.1.5.2.2
- *    stops at 10400; the rates above it are there because AT IB and J2534
- *    both offer them for the manufacturer specific systems that use them.
+ *  - BUS_P_DATA_RATE accepts 1200 to KLINE_BAUD_HW_MAX (115200). ISO 14230-2
+ *    clause 5.1.5.2.2 stops at 10400; the rates above it are there because
+ *    AT IB and J2534 both offer them for the manufacturer specific systems
+ *    that use them, BMW's among them.
+ *  - BUS_P_KLINE_FRAME_MODE may be BUS_KLINE_FRAME_DS2: messages are then
+ *    framed by the DS2 length byte and checked and generated with the DS2 XOR
+ *    checksum (ds2_codec.h). Parity and baud are separate parameters; DS2 is
+ *    normally 9600 baud 8E1. BUS_KLINE_FRAME_RAW delivers each UART byte as
+ *    its own message and publishes physical TX echo to the receive queue;
+ *    BUS_IOCTL_BREAK_SET asserts or releases a GPIO break on the TX pin.
+ *  - BUS_P_K_LINE_BRIDGE_78 requests joining OBD pin 7 to pin 8 (BMW
+ *    DS2/ADS). It is a software hook only: the stock board has no pin 8
+ *    K-Line driver, so the request is stored and reported, nothing is driven,
+ *    and a warning is logged. It needs a hardware rework (see pinout.h).
  */
 extern const bus_ops_t kline_bus_ops;

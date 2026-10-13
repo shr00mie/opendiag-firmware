@@ -70,8 +70,13 @@ void fake_bus_kline_set_variant(kline_variant_t v);
 
 /** The rate AT IB pushed down, and the wakeup AT SW / AT WM did. */
 uint32_t fake_bus_kline_baud(void);
+uint32_t fake_bus_kline_parity(void);
+uint32_t fake_bus_kline_frame_mode(void);
 uint32_t fake_bus_kline_wakeup_ms(void);
 const uint8_t *fake_bus_kline_wakeup(size_t *out_len);
+
+/** Last BUS_IOCTL_BREAK_SET value (0 or 1). K-Line only. */
+uint32_t fake_bus_kline_break(void);
 
 /** Makes the next send on @p bus fail. */
 void fake_bus_fail_next_send(fake_bus_id_t bus);

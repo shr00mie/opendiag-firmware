@@ -33,3 +33,12 @@ TEST(unknown_parameter_names_do_not_select_another_setting) {
     TEST_ASSERT_FALSE(bus_param_from_name(NULL, &actual));
     TEST_ASSERT_FALSE(bus_param_from_name("ifr-enabled", NULL));
 }
+
+TEST(ds2_and_bridge_parameters_have_shell_names) {
+    bus_param_t p = BUS_P_DATA_RATE;
+
+    TEST_ASSERT_TRUE(bus_param_from_name("kline-frame-mode", &p));
+    TEST_ASSERT_EQUAL_INT(BUS_P_KLINE_FRAME_MODE, p);
+    TEST_ASSERT_TRUE(bus_param_from_name("bridge78", &p));
+    TEST_ASSERT_EQUAL_INT(BUS_P_K_LINE_BRIDGE_78, p);
+}

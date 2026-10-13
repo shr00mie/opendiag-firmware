@@ -508,6 +508,8 @@ TEST(the_obd_initialisation_address_and_default_rate_are_the_legislated_ones) {
      * faster rates for the manufacturer specific systems that use them. */
     TEST_ASSERT_EQUAL_INT(1200, KLINE_BAUD_MIN);
     TEST_ASSERT(KLINE_BAUD_HW_MAX >= KLINE_BAUD_MAX);
+    TEST_ASSERT_EQUAL_INT(10400, KLINE_BAUD_MAX);
+    TEST_ASSERT(KLINE_BAUD_HW_MAX >= 115200);
 }
 
 TEST(the_default_wakeup_messages_are_the_ones_the_datasheet_names) {

@@ -190,14 +190,38 @@ typedef enum {
     /* K-Line initialization uses pin 15 as well when false. Default true. */
     BUS_P_K_LINE_ONLY,
 
-    /* K-Line: discovery (0), ISO9141 gap (1), ISO14230 length/gap (2). */
+    /* K-Line: discovery (0), ISO9141 gap (1), ISO14230 length/gap (2),
+     * BMW DS2 length/XOR (3), raw byte pipe (4). */
     BUS_P_KLINE_FRAME_MODE,
+
+    /*
+     * K-Line: request the pin 7 <-> pin 8 bridge. Default off.
+     *
+     * Software hook only. The stock board has no pin 8 K-Line driver (see
+     * pinout.h), so the value is stored and reported and nothing is driven;
+     * the driver logs that hardware rework is required. A caller must not
+     * treat a successful set as evidence that pin 8 is connected.
+     */
+    BUS_P_K_LINE_BRIDGE_78,
 } bus_param_t;
 
 typedef enum {
     BUS_KLINE_FRAME_DISCOVERY = 0,
     BUS_KLINE_FRAME_ISO9141,
     BUS_KLINE_FRAME_ISO14230,
+    /*
+     * BMW DS2: address, total length, data, XOR checksum (ds2_codec.h).
+     * Replaces the ISO 8 bit sum on transmit and on receive framing. Parity
+     * and baud are still set through BUS_P_PARITY and BUS_P_DATA_RATE.
+     */
+    BUS_KLINE_FRAME_DS2,
+    /*
+     * Transparent byte pipe: each UART byte is one receive message. No ISO
+     * or DS2 framing. Transmit still verifies the physical echo and, in this
+     * mode, also delivers each echoed byte to the receive queue so a
+     * half-duplex host sees its own TX.
+     */
+    BUS_KLINE_FRAME_RAW,
 } bus_kline_frame_mode_t;
 
 /* J2534 Table 86 values for BUS_P_PARITY. */
@@ -297,6 +321,15 @@ typedef enum {
      * a protocol variant.
      */
     BUS_IOCTL_ASSUME_LINK,
+
+    /**
+     * Assert or release a K-Line break by bit-banging the TX pin.
+     *
+     * in: const uint32_t *: non-zero drives TX low as GPIO (break asserted);
+     *     zero restores the UART TX pin (break released). Release and stop
+     *     clear an asserted break.
+     */
+    BUS_IOCTL_BREAK_SET,
 } bus_ioctl_t;
 
 /** Longest message a periodic transmission may carry. The ELM327's AT WM

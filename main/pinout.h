@@ -15,6 +15,10 @@
 #define PIN_KLINE_TX 17
 #define PIN_KLINE_RX 18
 #define PIN_KLINE_nSILENT 21
+/* Stock hardware drives K-Line on OBD pin 7 only. There is no pin 8 K-Line
+ * driver and no GPIO for one, so BUS_P_K_LINE_BRIDGE_78 (bridge78) is a
+ * software flag that changes nothing electrically. Bridging pin 7 to pin 8
+ * (BMW DS2/ADS) needs a hardware rework first; add its pin here then. */
 
 /* J1850 IO */
 #define PIN_J1850_MODE 11

@@ -709,6 +709,38 @@ TEST(k_line_and_l_line_require_matching_resources_and_preserve_flags) {
     }
 }
 
+TEST(k_line_connect_accepts_rates_up_to_the_hardware_ceiling) {
+    const uint32_t rates[] = {1200, 10400, 15625, KLINE_BAUD_HW_MAX};
+
+    for (unsigned i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
+        command(opendiag_Request_connect_tag);
+        req.command.connect = (opendiag_Connect){.device = dev,
+                                                 .protocol = J2534_ISO14230,
+                                                 .flags = J2534_K_ONLY,
+                                                 .baudrate = rates[i],
+                                                 .connector = 1,
+                                                 .pins_count = 1,
+                                                 .pins = {7}};
+        TEST_ASSERT_EQUAL_INT(0, call());
+        uint32_t channel = res.id;
+        command(opendiag_Request_disconnect_tag);
+        req.command.disconnect.id = channel;
+        TEST_ASSERT_EQUAL_INT(0, call());
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        command(opendiag_Request_connect_tag);
+        req.command.connect = (opendiag_Connect){
+            .device = dev,
+            .protocol = J2534_ISO14230,
+            .flags = J2534_K_ONLY,
+            .baudrate = i ? 0 : KLINE_BAUD_HW_MAX + 1,
+            .connector = 1,
+            .pins_count = 1,
+            .pins = {7}};
+        TEST_ASSERT_EQUAL_INT(J2534_BAUD, call());
+    }
+}
+
 static uint32_t hds_channel(bool checksum) {
     command(opendiag_Request_connect_tag);
     req.command.connect =

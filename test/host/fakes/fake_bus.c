@@ -62,6 +62,9 @@ static int g_connect_result;
 static bus_link_t g_link;
 static bus_stats_t g_stats[FAKE_BUS_COUNT];
 static uint32_t g_kline_baud;
+static uint32_t g_kline_parity;
+static uint32_t g_kline_frame_mode;
+static uint32_t g_kline_break;
 static uint32_t g_kline_only;
 static void (*g_kline_only_hook)(void);
 static int g_kline_only_result;
@@ -82,6 +85,9 @@ void fake_bus_reset_all(void) {
     g_stop_comm_count = 0;
     g_connect_result = 0;
     g_kline_baud = KLINE_BAUD_DEFAULT;
+    g_kline_parity = BUS_PARITY_NONE;
+    g_kline_frame_mode = BUS_KLINE_FRAME_DISCOVERY;
+    g_kline_break = 0;
     g_kline_only = 1;
     g_kline_only_hook = NULL;
     g_kline_only_result = 0;
@@ -189,7 +195,10 @@ int fake_bus_stop_comm_count(void) { return g_stop_comm_count; }
 
 void fake_bus_kline_connect_result(int rc) { g_connect_result = rc; }
 uint32_t fake_bus_kline_baud(void) { return g_kline_baud; }
+uint32_t fake_bus_kline_parity(void) { return g_kline_parity; }
+uint32_t fake_bus_kline_frame_mode(void) { return g_kline_frame_mode; }
 uint32_t fake_bus_kline_wakeup_ms(void) { return g_wakeup_ms; }
+uint32_t fake_bus_kline_break(void) { return g_kline_break; }
 
 void fake_bus_kline_set_variant(kline_variant_t v) {
     g_link.variant = (uint8_t)v;
@@ -437,6 +446,12 @@ static int fake_set_param(bus_param_t p, uint32_t value) {
     case BUS_P_DATA_RATE:
         g_kline_baud = value;
         return 0;
+    case BUS_P_PARITY:
+        g_kline_parity = value;
+        return 0;
+    case BUS_P_KLINE_FRAME_MODE:
+        g_kline_frame_mode = value;
+        return 0;
     case BUS_P_PERIODIC_MS:
         g_wakeup_ms = value;
         return 0;
@@ -465,6 +480,12 @@ static int fake_get_param(bus_param_t p, uint32_t *out) {
         return 0;
     case BUS_P_DATA_RATE:
         *out = g_kline_baud;
+        return 0;
+    case BUS_P_PARITY:
+        *out = g_kline_parity;
+        return 0;
+    case BUS_P_KLINE_FRAME_MODE:
+        *out = g_kline_frame_mode;
         return 0;
     case BUS_P_PERIODIC_MS:
         *out = g_wakeup_ms;
@@ -545,6 +566,13 @@ static int fake_kline_ioctl(bus_ioctl_t id, const void *in, void *out) {
         if (in) {
             g_link.variant = (uint8_t)*(const kline_variant_t *)in;
         }
+        return 0;
+
+    case BUS_IOCTL_BREAK_SET:
+        if (!in) {
+            return BUS_ERR_BAD_ARG;
+        }
+        g_kline_break = *(const uint32_t *)in != 0 ? 1u : 0u;
         return 0;
 
     case BUS_IOCTL_SET_PERIODIC: {

@@ -37,6 +37,7 @@
 
 #include "bus.h"
 #include "bus_tx.h"
+#include "ds2_codec.h"
 #include "kline.h"
 #include "pinout.h"
 #include "utility.h"
@@ -172,6 +173,10 @@ typedef struct {
     bool k_line_only;
     uint32_t frame_mode;
 
+    /* Requested pin 7 <-> pin 8 bridge. Stored and reported only: stock
+     * hardware has no pin 8 K-Line driver, so nothing is ever driven. */
+    bool bridge78;
+
     /**
      * Retransmissions after a corrupted transmission. Zero.
      *
@@ -278,6 +283,9 @@ static struct {
     uint32_t sync_edge_count;
 
     bus_stats_t stats;
+
+    /* BUS_IOCTL_BREAK_SET: TX pin held low as GPIO instead of UART. */
+    bool break_asserted;
 } g;
 
 static bool command_blocked(void) {
@@ -668,7 +676,31 @@ static bool asm_complete(bool gap_elapsed, kline_frame_t *out) {
         return false;
     }
 
-    if (g.cfg.frame_mode != BUS_KLINE_FRAME_ISO9141) {
+    /* Raw mode: every byte is a message. No ISO/DS2 length or checksum. */
+    if (g.cfg.frame_mode == BUS_KLINE_FRAME_RAW) {
+        out->data[0] = g.asm_buf[0];
+        out->len = 1;
+        out->status = 0;
+        out->start_us = g.asm_start_us;
+        out->end_us = g.asm_last_us;
+        if (g.asm_len > 1) {
+            memmove(g.asm_buf, g.asm_buf + 1, g.asm_len - 1);
+            g.asm_len--;
+            g.asm_start_us = g.asm_last_us;
+        } else {
+            g.asm_len = 0;
+        }
+        return true;
+    }
+
+    if (g.cfg.frame_mode == BUS_KLINE_FRAME_DS2) {
+        /* DS2 carries the whole message length in byte 1, so the length ends
+         * the message; the gap is only the backstop for a bad length byte. */
+        want = ds2_frame_len(g.asm_buf, g.asm_len);
+        if (want && g.asm_len == want) {
+            goto validate;
+        }
+    } else if (g.cfg.frame_mode != BUS_KLINE_FRAME_ISO9141) {
         want = kline_msg_len(g.asm_buf, g.asm_len);
         if (want && g.asm_len == want &&
             (g.cfg.frame_mode == BUS_KLINE_FRAME_ISO14230 ||
@@ -689,6 +721,8 @@ static bool asm_complete(bool gap_elapsed, kline_frame_t *out) {
 
     if (g.asm_len < (g.cfg.frame_mode == BUS_KLINE_FRAME_ISO9141
                          ? (g.cfg.checksum_rx ? 2u : 1u)
+                     : g.cfg.frame_mode == BUS_KLINE_FRAME_DS2
+                         ? (size_t)DS2_MIN_FRAME
                          : KLINE_MIN_MSG)) {
         /* One or two bytes and then silence. A line settling after an
          * initialisation, or an ECU that gave up mid-message. */
@@ -698,11 +732,15 @@ static bool asm_complete(bool gap_elapsed, kline_frame_t *out) {
     }
 
 validate:
-    checksum_ok =
-        g.cfg.frame_mode == BUS_KLINE_FRAME_ISO9141
-            ? g.asm_len >= 2 && kline_checksum(g.asm_buf, g.asm_len - 1) ==
-                                    g.asm_buf[g.asm_len - 1]
-            : kline_frame_ok(g.asm_buf, g.asm_len);
+    if (g.cfg.frame_mode == BUS_KLINE_FRAME_DS2) {
+        checksum_ok = ds2_frame_ok(g.asm_buf, g.asm_len);
+    } else {
+        checksum_ok =
+            g.cfg.frame_mode == BUS_KLINE_FRAME_ISO9141
+                ? g.asm_len >= 2 && kline_checksum(g.asm_buf, g.asm_len - 1) ==
+                                        g.asm_buf[g.asm_len - 1]
+                : kline_frame_ok(g.asm_buf, g.asm_len);
+    }
     if ((g.cfg.checksum_rx || g.cfg.frame_mode == BUS_KLINE_FRAME_DISCOVERY) &&
         !checksum_ok) {
         g.stats.rx_bad_checksum++;
@@ -1031,6 +1069,17 @@ static void tx_read_echo(kline_tx_t *tx, size_t limit) {
         }
         tx->echoed++;
         g.stats.tx_echo_ok++;
+        /* Half-duplex hosts need the physical echo as receive traffic. */
+        if (g.cfg.frame_mode == BUS_KLINE_FRAME_RAW) {
+            kline_frame_t echo = {
+                .len = 1,
+                .status = 0,
+                .start_us = g.uart_pending_us,
+                .end_us = g.uart_pending_us,
+            };
+            echo.data[0] = byte;
+            publish(&echo);
+        }
     }
 }
 
@@ -1192,7 +1241,9 @@ static size_t frame_for_tx(const uint8_t *data, size_t len, uint32_t flags,
 
     memcpy(out, data, len);
     if (add) {
-        out[len] = kline_checksum(data, len);
+        out[len] = g.cfg.frame_mode == BUS_KLINE_FRAME_DS2
+                       ? ds2_checksum(data, len)
+                       : kline_checksum(data, len);
         len += 1;
     }
 
@@ -1210,6 +1261,37 @@ static void init_set_level(bool high) {
          * TX. */
         gpio_set_level(PIN_LS_OBD_15, !high);
     }
+}
+
+/** @brief Release a BUS_IOCTL_BREAK_SET hold, restoring UART TX when up. */
+static void break_clear(void) {
+    if (!g.break_asserted) {
+        return;
+    }
+    init_set_level(true);
+    if (g.uart_installed) {
+        tx_pin_to_uart();
+    }
+    g.break_asserted = false;
+}
+
+/**
+ * @brief Drive or release a host-requested K-Line break.
+ *
+ * Assert takes the TX pin as GPIO and holds it low; release restores the UART
+ * pin. Used by BMWeb-style hosts that bit-bang 5-baud or fast-init themselves.
+ */
+static int break_set(bool assert) {
+    if (assert) {
+        if (!g.break_asserted) {
+            tx_pin_to_gpio();
+            init_set_level(false);
+            g.break_asserted = true;
+        }
+        return 0;
+    }
+    break_clear();
+    return 0;
 }
 
 /**
@@ -1599,6 +1681,8 @@ static int do_stop_comm(void) {
     uint8_t msg[8];
     size_t n = 0;
 
+    break_clear();
+
     if (!g.link.connected) {
         return 0;
     }
@@ -1802,6 +1886,7 @@ static void cfg_defaults(kline_cfg_t *c) {
 
 /* api_lock held; no worker may still use these resources. */
 static esp_err_t kline_release(void) {
+    break_clear();
     if (!g.cfg.k_line_only) {
         gpio_set_level(PIN_LS_OBD_15, 0);
     }
@@ -1881,6 +1966,7 @@ static esp_err_t kline_open(const bus_cfg_t *cfg) {
     g.rx_invalid = false;
     g.suppress_until_us = 0;
     g.pending_status = 0;
+    g.break_asserted = false;
     g.tx_answered = true;
     memset(&g.rx_epoch, 0, sizeof(g.rx_epoch));
     g.req_control = g.active_control = NULL;
@@ -2139,7 +2225,7 @@ static uint32_t *cfg_slot(bus_param_t p, uint32_t *lo, uint32_t *hi) {
         *hi = 8;
         return &g.cfg.tx_retries;
     case BUS_P_KLINE_FRAME_MODE:
-        *hi = BUS_KLINE_FRAME_ISO14230;
+        *hi = BUS_KLINE_FRAME_RAW;
         return &g.cfg.frame_mode;
     case BUS_P_PERIODIC_MS:
         *hi = 0xFFFFFF;
@@ -2160,6 +2246,8 @@ static bool *cfg_flag(bus_param_t p) {
         return &g.cfg.checksum_tx;
     case BUS_P_K_LINE_ONLY:
         return &g.cfg.k_line_only;
+    case BUS_P_K_LINE_BRIDGE_78:
+        return &g.cfg.bridge78;
     case BUS_P_PERIODIC_QUIET:
         return &g.cfg.periodic_quiet;
     case BUS_P_TIMING_FROM_KEYBYTES:
@@ -2196,6 +2284,10 @@ static int kline_set_param(bus_param_t p, uint32_t value) {
             }
             /* Release before enabling L-Line or returning its pin to VIF. */
             gpio_set_level(PIN_LS_OBD_15, 0);
+        }
+        if (p == BUS_P_K_LINE_BRIDGE_78 && value != 0) {
+            ESP_LOGW(TAG, "bridge78 requested: stock hardware has no pin 8 "
+                          "K-Line driver, hardware rework required; no-op");
         }
         *flag = value != 0;
         goto done;
@@ -2337,6 +2429,23 @@ static int kline_ioctl(bus_ioctl_t id, const void *in, void *out) {
         }
         UNLOCK();
         return 0;
+    }
+
+    case BUS_IOCTL_BREAK_SET: {
+        uint32_t value;
+
+        if (!in) {
+            return BUS_ERR_BAD_ARG;
+        }
+        value = *(const uint32_t *)in;
+        xSemaphoreTake(g.api_lock, portMAX_DELAY);
+        if (command_blocked()) {
+            xSemaphoreGive(g.api_lock);
+            return BUS_ERR_NOT_READY;
+        }
+        rc = break_set(value != 0);
+        xSemaphoreGive(g.api_lock);
+        return rc;
     }
 
     case BUS_IOCTL_SET_PERIODIC: {

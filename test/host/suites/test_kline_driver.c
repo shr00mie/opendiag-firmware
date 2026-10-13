@@ -1116,3 +1116,119 @@ TEST(kline_uart_overflow_blocks_repeat_admission_without_a_later_response) {
     TEST_ASSERT_EQUAL_INT(1, message.sequence);
     TEST_ASSERT_EQUAL_INT(0, uart_tx_count);
 }
+
+TEST(data_rate_accepts_up_to_115200_and_no_further) {
+    TEST_ASSERT_EQUAL_INT(ESP_OK, kline_open(NULL));
+    uint32_t value = 0;
+
+    TEST_ASSERT_TRUE(KLINE_BAUD_HW_MAX >= 115200);
+    TEST_ASSERT_EQUAL_INT(0, kline_set_param(BUS_P_DATA_RATE, 15625));
+    TEST_ASSERT_EQUAL_INT(0, kline_set_param(BUS_P_DATA_RATE, 115200));
+    TEST_ASSERT_EQUAL_INT(0, kline_get_param(BUS_P_DATA_RATE, &value));
+    TEST_ASSERT_EQUAL_INT(115200, value);
+    TEST_ASSERT_EQUAL_INT(115200, g.active_baud);
+    TEST_ASSERT_EQUAL_INT(
+        BUS_ERR_BAD_ARG, kline_set_param(BUS_P_DATA_RATE, KLINE_BAUD_HW_MAX + 1));
+    TEST_ASSERT_EQUAL_INT(BUS_ERR_BAD_ARG,
+                          kline_set_param(BUS_P_DATA_RATE, KLINE_BAUD_MIN - 1));
+    /* The ISO sync range is untouched by the higher hardware ceiling. */
+    TEST_ASSERT_EQUAL_INT(10400, KLINE_BAUD_MAX);
+}
+
+TEST(ds2_frame_mode_is_selectable_and_unknown_modes_are_refused) {
+    TEST_ASSERT_EQUAL_INT(ESP_OK, kline_open(NULL));
+    uint32_t value = 0;
+
+    TEST_ASSERT_EQUAL_INT(0,
+                          kline_set_param(BUS_P_KLINE_FRAME_MODE, BUS_KLINE_FRAME_DS2));
+    TEST_ASSERT_EQUAL_INT(0, kline_get_param(BUS_P_KLINE_FRAME_MODE, &value));
+    TEST_ASSERT_EQUAL_INT(BUS_KLINE_FRAME_DS2, value);
+    TEST_ASSERT_EQUAL_INT(0,
+                          kline_set_param(BUS_P_KLINE_FRAME_MODE, BUS_KLINE_FRAME_RAW));
+    TEST_ASSERT_EQUAL_INT(0, kline_get_param(BUS_P_KLINE_FRAME_MODE, &value));
+    TEST_ASSERT_EQUAL_INT(BUS_KLINE_FRAME_RAW, value);
+    TEST_ASSERT_EQUAL_INT(
+        BUS_ERR_BAD_ARG,
+        kline_set_param(BUS_P_KLINE_FRAME_MODE, BUS_KLINE_FRAME_RAW + 1));
+}
+
+TEST(ds2_mode_appends_the_xor_checksum_and_iso_modes_keep_the_sum) {
+    const uint8_t req[] = {0x12, 0x04, 0x00};
+    const uint8_t sum_req[] = {0xFF, 0x01};
+    uint8_t out[8];
+
+    TEST_ASSERT_EQUAL_INT(ESP_OK, kline_open(NULL));
+    g.cfg.frame_mode = BUS_KLINE_FRAME_DS2;
+    TEST_ASSERT_EQUAL_INT(4, frame_for_tx(req, sizeof(req), 0, out));
+    TEST_ASSERT_EQUAL_INT(0x16, out[3]);
+    TEST_ASSERT_EQUAL_INT(3, frame_for_tx(sum_req, sizeof(sum_req), 0, out));
+    TEST_ASSERT_EQUAL_INT(0xFE, out[2]);
+    /* The caller can still own the checksum. */
+    TEST_ASSERT_EQUAL_INT(
+        3, frame_for_tx(req, sizeof(req), BUS_TX_NO_CHECKSUM, out));
+    g.cfg.checksum_tx = false;
+    TEST_ASSERT_EQUAL_INT(3, frame_for_tx(req, sizeof(req), 0, out));
+
+    g.cfg.checksum_tx = true;
+    g.cfg.frame_mode = BUS_KLINE_FRAME_ISO14230;
+    TEST_ASSERT_EQUAL_INT(3, frame_for_tx(sum_req, sizeof(sum_req), 0, out));
+    TEST_ASSERT_EQUAL_INT(0x00, out[2]);
+    g.cfg.frame_mode = BUS_KLINE_FRAME_DISCOVERY;
+    TEST_ASSERT_EQUAL_INT(3, frame_for_tx(sum_req, sizeof(sum_req), 0, out));
+    TEST_ASSERT_EQUAL_INT(0x00, out[2]);
+}
+
+TEST(ds2_mode_frames_receive_on_the_length_byte) {
+    /* Reply with a data byte that looks like an ISO format byte. */
+    const uint8_t reply[] = {0x00, 0x06, 0xA0, 0x80, 0x01, 0x27};
+    kline_frame_t frame;
+
+    TEST_ASSERT_EQUAL_INT(ESP_OK, kline_open(NULL));
+    g.cfg.frame_mode = BUS_KLINE_FRAME_DS2;
+    g.cfg.checksum_rx = true;
+    stage_uart_reply(reply, sizeof(reply));
+    TEST_ASSERT_EQUAL_INT(1, rx_service(now_us() + 100000, &frame, true));
+    TEST_ASSERT_EQUAL_INT(sizeof(reply), frame.len);
+    TEST_ASSERT_EQUAL_MEM(reply, frame.data, sizeof(reply));
+    TEST_ASSERT_EQUAL_INT(0, frame.status);
+}
+
+TEST(ds2_mode_flags_or_drops_a_bad_checksum_by_policy) {
+    uint8_t reply[] = {0x00, 0x05, 0xA0, 0x01, 0x00};
+    kline_frame_t frame;
+
+    reply[4] = (uint8_t)(0x00 ^ 0x05 ^ 0xA0 ^ 0x01 ^ 0xFF);
+    TEST_ASSERT_EQUAL_INT(ESP_OK, kline_open(NULL));
+    g.cfg.frame_mode = BUS_KLINE_FRAME_DS2;
+
+    /* Verification on: a bad checksum is dropped and counted. */
+    g.cfg.checksum_rx = true;
+    stage_uart_reply(reply, sizeof(reply));
+    TEST_ASSERT_EQUAL_INT(0, rx_service(now_us() + 100000, &frame, true));
+    TEST_ASSERT_EQUAL_INT(1, g.stats.rx_bad_checksum);
+
+    /* Verification off: the frame is delivered still ended by its length. */
+    g.cfg.checksum_rx = false;
+    stage_uart_reply(reply, sizeof(reply));
+    TEST_ASSERT_EQUAL_INT(1, rx_service(now_us() + 100000, &frame, true));
+    TEST_ASSERT_EQUAL_INT(sizeof(reply), frame.len);
+}
+
+TEST(bridge78_is_stored_and_reported_but_drives_nothing) {
+    uint32_t value = 99;
+
+    TEST_ASSERT_EQUAL_INT(ESP_OK, kline_open(NULL));
+    TEST_ASSERT_EQUAL_INT(0, kline_get_param(BUS_P_K_LINE_BRIDGE_78, &value));
+    TEST_ASSERT_EQUAL_INT(0, value);
+
+    capture_edges = true;
+    edge_count = 0;
+    TEST_ASSERT_EQUAL_INT(0, kline_set_param(BUS_P_K_LINE_BRIDGE_78, 1));
+    capture_edges = false;
+    TEST_ASSERT_EQUAL_INT(0, edge_count);
+    TEST_ASSERT_EQUAL_INT(0, kline_get_param(BUS_P_K_LINE_BRIDGE_78, &value));
+    TEST_ASSERT_EQUAL_INT(1, value);
+    TEST_ASSERT_EQUAL_INT(0, kline_set_param(BUS_P_K_LINE_BRIDGE_78, 0));
+    TEST_ASSERT_EQUAL_INT(0, kline_get_param(BUS_P_K_LINE_BRIDGE_78, &value));
+    TEST_ASSERT_EQUAL_INT(0, value);
+}

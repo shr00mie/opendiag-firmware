@@ -271,10 +271,14 @@ typedef enum {
  * @brief The fastest rate the driver will accept.
  *
  * Above what the standard allows, because AT IB offers 12500 and 15625 and
- * the systems that want them are not OBD systems - they are the manufacturer
- * specific ones a scan tool also has to reach.
+ * J2534 DATA_RATE offers more; the systems that want them are not OBD
+ * systems - they are the manufacturer specific ones a scan tool also has to
+ * reach (BMW fast rates among them). The ESP32-S3 UART takes 115200 and the
+ * transceiver is the practical limit, so this only caps what the driver will
+ * ask of the peripheral. KLINE_BAUD_MAX still bounds the ISO 5 baud
+ * synchronisation range and is not affected.
  */
-#define KLINE_BAUD_HW_MAX 15625
+#define KLINE_BAUD_HW_MAX 115200
 
 /**
  * @brief Number of transitions in an 8N1 $55 synchronisation character.
