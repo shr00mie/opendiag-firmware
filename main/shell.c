@@ -1276,7 +1276,55 @@ static void ble_command(int argc, char **argv) {
         return;
     }
 
+    if (argc > 1 && strcmp(argv[1], "compat") == 0) {
+        esp_err_t err;
+
+        if (argc < 3 || (strcmp(argv[2], "on") != 0 &&
+                         strcmp(argv[2], "off") != 0)) {
+            printf("Usage: ble compat on|off\n");
+            return;
+        }
+
+        err = ble_uart_set_security_mode(strcmp(argv[2], "on") == 0
+                                             ? BLE_SEC_COMPAT
+                                             : BLE_SEC_STRICT);
+        printf("BLE security: %s. Applies to the next connection.%s\n",
+               ble_sec_mode_name(ble_uart_security_mode()),
+               err == ESP_OK ? "" : " (not saved; lost at reboot)");
+        if (ble_uart_security_mode() == BLE_SEC_COMPAT) {
+            printf("WARNING: compat lets any phone in range use the data "
+                   "link without pairing. Turn it off when done.\n");
+        }
+        return;
+    }
+
+    if (argc > 1 && strcmp(argv[1], "name") == 0) {
+        esp_err_t err;
+
+        if (argc < 3) {
+            printf("BLE name: %s\n", ble_uart_gap_name());
+            return;
+        }
+
+        err = ble_uart_set_gap_name(argv[2]);
+        if (err == ESP_ERR_INVALID_ARG) {
+            printf("Usage: ble name <OpenDIAG|OBDII>\n");
+            return;
+        }
+        printf("BLE name: %s%s\n", ble_uart_gap_name(),
+               err == ESP_OK ? "" : " (not saved; lost at reboot)");
+        return;
+    }
+
+    if (argc > 1) {
+        printf("Usage: ble [pair|forget|compat on|off|name "
+               "<OpenDIAG|OBDII>]\n");
+        return;
+    }
+
     printf("BLE link\n");
+    printf("  name: %s\n", ble_uart_gap_name());
+    printf("  security: %s\n", ble_sec_mode_name(ble_uart_security_mode()));
     printf("  bonded phones: %d\n", ble_uart_bond_count());
     printf("  pairing window: %s\n",
            ble_uart_pairing_window_open() ? "OPEN" : "closed");
@@ -1450,7 +1498,8 @@ const shell_command_t commands[] = {
      "CAN. Usage: can [cycles] - bring up/tear down loop; can stats - "
      "controller counters"},
     {"ble", ble_command,
-     "BLE link security. Usage: ble | ble pair | ble forget"},
+     "BLE link. Usage: ble | ble pair | ble forget | ble compat on|off | "
+     "ble name <OpenDIAG|OBDII>"},
     {"comm", comm_command, "comm_iface ports. Usage: comm [trace|clear]"},
     {"vif", vif_command, "Show vehicle interface owners and claims"},
     {"link", link_command,

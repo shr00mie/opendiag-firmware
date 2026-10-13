@@ -17,6 +17,7 @@
 #include "host/util/util.h"
 #include "nimble/nimble_npl.h"
 #include "nimble/nimble_port.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 #include "services/gap/ble_svc_gap.h"
@@ -26,7 +27,6 @@
 #define TAG "BLE_UART"
 #define ENABLE_BLE_TRACE 0
 
-#define DEVICE_NAME "OpenDIAG"
 #define BLE_GAP_APPEARANCE_GENERIC_TAG 0x0200
 #define BLE_GAP_URI_PREFIX_HTTPS 0x17
 #define BLE_GAP_LE_ROLE_PERIPHERAL 0x00
@@ -38,45 +38,49 @@ extern void ble_store_config_init(void);
 
 static ble_uart_rx_cb_t ble_rx_callback;
 
-/* {6E400001-B5A3-F393-E0A9-E50E24DCCA9E} */
-static const ble_uuid128_t gatt_svr_svc_uart_uuid =
-    BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0, 0x93, 0xf3,
-                     0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e);
-
-/* {6E400002-B5A3-F393-E0A9-E50E24DCCA9E} */
-static const ble_uuid128_t gatt_svr_chr_uart_write_uuid =
-    BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0, 0x93, 0xf3,
-                     0xa3, 0xb5, 0x02, 0x00, 0x40, 0x6e);
-
-/* {6E400003-B5A3-F393-E0A9-E50E24DCCA9E} */
-static const ble_uuid128_t gatt_svr_chr_uart_read_uuid =
-    BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0, 0x93, 0xf3,
-                     0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e);
-
 /*
- * {6E400004-B5A3-F393-E0A9-E50E24DCCA9E}: the control plane.
+ * The characteristics the GATT table registers, flattened. ble_profiles.c is
+ * the contract - which services, which UUIDs, which direction - and this is
+ * the table built from it, so the access callback can say what a write landed
+ * on by looking at the slot it was handed rather than comparing UUIDs.
  *
- * A sibling of the UART pair rather than a second service, because it is not
- * a second data pipe: it has no session and no front-end of its own, which is
- * what keeps it reachable whatever grammar the data characteristics are
- * carrying. One command per write - GATT already frames each write as a whole
- * message, so there is no line assembly here and no terminator to agree on.
+ * Every data profile writes into the same receive callback and is answered
+ * through the same ble_uart_send(): the profiles are only different doors onto
+ * one session. The control characteristic is the one slot that is not.
  */
-static const ble_uuid128_t gatt_svr_chr_ctrl_uuid =
-    BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0, 0x93, 0xf3,
-                     0xa3, 0xb5, 0x04, 0x00, 0x40, 0x6e);
+#define BLE_SLOT_CTRL BLE_PROFILE_COUNT /* "profile" index of the control slot */
+#define BLE_SLOT_MAX (BLE_PROFILE_COUNT * BLE_PROFILE_MAX_CHRS + 1)
 
-// Connection handle for the current connection
+typedef struct {
+    const ble_profile_chr_t *def;
+    uint8_t profile; /* ble_profile_id_t, or BLE_SLOT_CTRL */
+    uint16_t handle; /* Filled in by the stack at registration. */
+} ble_slot_t;
+
+static ble_slot_t g_slots[BLE_SLOT_MAX];
+static int g_slot_count;
+
+/* One service and its characteristics' UUIDs, in the stack's own type. */
+static ble_uuid_any_t g_uuids[(BLE_PROFILE_COUNT + 1) *
+                              (1 + BLE_PROFILE_MAX_CHRS)];
+static int g_uuid_count;
+
+static struct ble_gatt_chr_def g_chr_defs[BLE_PROFILE_COUNT + 1]
+                                         [BLE_PROFILE_MAX_CHRS + 1];
+static struct ble_gatt_svc_def g_svc_defs[BLE_PROFILE_COUNT + 2];
+
+/* Connection handle for the current connection */
 static uint16_t conn_handle;
 
-/* ble uart attr read handle */
-static uint16_t g_bleuart_attr_read_handle;
+/*
+ * Which data profile the client is using, so replies go out on the
+ * characteristic it subscribed to or last wrote to. Starts on NUS, which is
+ * where the adapter always answered before the other layouts existed.
+ */
+static volatile uint8_t g_active_profile = BLE_PROFILE_NUS;
 
-/* ble uart attr write handle */
-static uint16_t g_bleuart_attr_write_handle;
-
-/* control characteristic handle */
-static uint16_t g_blectrl_attr_handle;
+/* The control slot, for replies. NULL until the table is built. */
+static const ble_slot_t *g_ctrl_slot;
 
 /**
  * @brief Largest single GATT write this accepts.
@@ -149,6 +153,22 @@ static int g_bonds_at_connect;
 static uint16_t g_latched_conn = 0xffff;
 static bool g_pairing_allowed;
 
+/*
+ * The security mode, and the name the adapter answers to. Both survive a
+ * reboot, and both are read once before the stack comes up. A mode change
+ * applies to the next connection: a link already up keeps the rules it was
+ * let in under.
+ */
+#define BLE_CFG_NAMESPACE "ble"
+#define BLE_CFG_KEY_SEC "sec"
+#define BLE_CFG_KEY_NAME "name"
+
+static volatile ble_sec_mode_t g_sec_mode = BLE_SEC_STRICT;
+static const char *g_gap_name = BLE_GAP_NAME_DEFAULT;
+
+/* The mode the current connection was admitted under. */
+static ble_sec_mode_t g_conn_sec_mode = BLE_SEC_STRICT;
+
 static void ble_pair_policy_set_bonds(int count, bool all_resolvable) {
     g_bond_count = count;
     g_bonds_resolvable = all_resolvable;
@@ -164,7 +184,7 @@ static bool ble_pair_policy_window_open(void) {
 
 static void ble_pair_policy_apply_led(void) {
     ws2812_led_set_state(ble_pair_policy_window_open() ? LED_STATE_PAIRING
-                                                       : LED_STATE_IDLE);
+                                                        : LED_STATE_IDLE);
 }
 
 static void ble_pair_policy_open_window(void) {
@@ -186,6 +206,10 @@ static void ble_pair_policy_close_window(void) {
 }
 
 static ble_adv_state_t ble_pair_policy_adv_state(void) {
+    if (g_sec_mode == BLE_SEC_COMPAT) {
+        return BLE_ADV_OPEN;
+    }
+
     if (ble_pair_policy_window_open()) {
         return BLE_ADV_PAIRABLE;
     }
@@ -217,6 +241,8 @@ const char *ble_adv_state_name(ble_adv_state_t state) {
         return "silent (press the button to pair)";
     case BLE_ADV_PAIRABLE:
         return "pairable";
+    case BLE_ADV_OPEN:
+        return "open to any phone (compat mode)";
     case BLE_ADV_LOCKED:
         return "bonded phones only";
     case BLE_ADV_DEGRADED:
@@ -244,8 +270,13 @@ static void ble_pair_policy_unlatch(uint16_t conn_handle) {
 
 static int ble_pair_policy_bonds_at_connect(void) { return g_bonds_at_connect; }
 
+/*
+ * COMPAT has no door to guard: it exists so an app that cannot pair can be
+ * brought up, so anyone may connect and a bond is nothing to refuse.
+ */
 static bool ble_pair_policy_may_bond(void) {
-    return g_pairing_allowed || ble_pair_policy_window_open();
+    return g_sec_mode == BLE_SEC_COMPAT || g_pairing_allowed ||
+           ble_pair_policy_window_open();
 }
 
 static void ble_pair_policy_note_bond_changed(void) { g_bond_changed = true; }
@@ -278,6 +309,7 @@ static void adv_apply(void);
 
 #define BLE_JOB_ADV_REFRESH (1u << 0)
 #define BLE_JOB_FORGET_BONDS (1u << 1)
+#define BLE_JOB_APPLY_NAME (1u << 2)
 
 static volatile uint32_t g_pending_jobs;
 static struct ble_npl_event g_job_ev;
@@ -448,8 +480,37 @@ static void ble_job_run(struct ble_npl_event *ev) {
         }
     }
 
+    if (jobs & BLE_JOB_APPLY_NAME) {
+        int rc = ble_svc_gap_device_name_set(g_gap_name);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "could not rename to %s, rc=%d", g_gap_name, rc);
+        }
+    }
+
     bond_state_refresh();
     adv_apply();
+}
+
+/*
+ * Whether a data write or subscription may be served on this link.
+ *
+ * The characteristics carry no encryption permission of their own, because
+ * that is fixed when the table is registered and the mode is not. So the
+ * check is made here, on every access: STRICT wants the link encrypted,
+ * COMPAT takes whatever the connection was admitted under.
+ *
+ * A write-without-response that fails here is dropped without a word - there
+ * is no response to carry the error - which is why STRICT asks for security
+ * from this side as soon as the link is up instead of waiting to be refused.
+ */
+static bool link_usable(uint16_t handle) {
+    struct ble_gap_conn_desc desc;
+
+    if (g_conn_sec_mode == BLE_SEC_COMPAT) {
+        return true;
+    }
+
+    return ble_gap_conn_find(handle, &desc) == 0 && desc.sec_state.encrypted;
 }
 
 // GATT server access callback function
@@ -468,6 +529,20 @@ static int gatt_svr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         if (conn_handle == g_evicted_conn) {
             ESP_LOGW(TAG, "write from an evicted peer; refused");
             return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+        }
+
+        const ble_slot_t *slot = arg;
+
+        if (!slot) {
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+
+        /* Data writes still need the link to have earned it. The control
+         * characteristic never gets here without encryption: its own
+         * permissions refuse that first, in either mode. */
+        if (slot->profile != BLE_SLOT_CTRL && !link_usable(conn_handle)) {
+            ESP_LOGW(TAG, "write on an unencrypted link; refused");
+            return BLE_ATT_ERR_INSUFFICIENT_ENC;
         }
 
         /*
@@ -501,12 +576,15 @@ static int gatt_svr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         }
         ble_trace('<', rx_flat, out_len);
 
-        if (attr_handle == g_blectrl_attr_handle) {
+        if (slot->profile == BLE_SLOT_CTRL) {
             if (ble_ctrl_callback) {
                 ble_ctrl_callback((const char *)rx_flat, out_len);
             }
             return 0;
         }
+
+        /* Replies follow whichever door the client is using. */
+        g_active_profile = slot->profile;
 
         if (ble_rx_callback) {
             ble_rx_callback(rx_flat, out_len);
@@ -518,62 +596,136 @@ static int gatt_svr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     }
 }
 
-/* GATT services table */
-static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
-    /* Heart rate service */
-    {
-        .type = BLE_GATT_SVC_TYPE_PRIMARY,
-        .uuid = &gatt_svr_svc_uart_uuid.u,
-        .characteristics =
-            (struct ble_gatt_chr_def[]){
-                {
-                    /* Characteristic: replies out, by notification.
-                     *
-                     * BLE_GATT_CHR_F_READ_ENC on a notify-only characteristic
-                     * is not about reading it - nobody does - it is what NimBLE
-                     * carries down onto the client configuration descriptor, so
-                     * an unencrypted peer cannot subscribe. Without that an
-                     * eavesdropper who never writes a byte could still sit and
-                     * collect every reply the vehicle sends. */
-                    .uuid = &gatt_svr_chr_uart_read_uuid.u,
-                    .val_handle = &g_bleuart_attr_read_handle,
-                    .access_cb = gatt_svr_access_cb,
-                    .flags = BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ_ENC,
-                },
-                {
-                    /* Characteristic: requests in.
-                     *
-                     * Write-without-response is the one an app actually uses,
-                     * and it is the awkward one to secure: there is no response
-                     * to carry an "insufficient authentication" error back in,
-                     * so an unencrypted write is simply dropped and the phone
-                     * is never told why. It still fails closed, which is what
-                     * matters here, but it is also why security is requested
-                     * from this side the moment a connection is up rather than
-                     * left to be triggered by a write that fails silently. */
-                    .uuid = &gatt_svr_chr_uart_write_uuid.u,
-                    .access_cb = gatt_svr_access_cb,
-                    .flags = BLE_GATT_CHR_F_WRITE |
-                             BLE_GATT_CHR_F_WRITE_NO_RSP |
-                             BLE_GATT_CHR_F_WRITE_ENC,
-                    .val_handle = &g_bleuart_attr_write_handle,
-                },
-                {
-                    /* Characteristic: control plane, in and out.
-                     *
-                     * This one switches a link's grammar, so it deserves at
-                     * least what the data path gets. */
-                    .uuid = &gatt_svr_chr_ctrl_uuid.u,
-                    .access_cb = gatt_svr_access_cb,
-                    .flags = BLE_GATT_CHR_F_WRITE |
-                             BLE_GATT_CHR_F_WRITE_NO_RSP |
-                             BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_WRITE_ENC |
-                             BLE_GATT_CHR_F_READ_ENC,
-                    .val_handle = &g_blectrl_attr_handle,
-                },
-                {0}},
-    },
-    {0}};
+/*
+ * GATT services table.
+ *
+ * Built from ble_profiles.c at start-up rather than written out, so the
+ * contract the host tests assert is the one the stack is given. Four data
+ * services and the control service, all primary: an app picks the layout it
+ * knows and ignores the rest.
+ */
+static ble_uuid_t *uuid_make(const ble_profile_uuid_t *u) {
+    ble_uuid_any_t *any;
+
+    if (g_uuid_count >= (int)(sizeof(g_uuids) / sizeof(g_uuids[0]))) {
+        return NULL;
+    }
+
+    any = &g_uuids[g_uuid_count];
+    if (ble_uuid_init_from_buf(any, u->bytes, u->len) != 0) {
+        return NULL;
+    }
+
+    g_uuid_count++;
+    return &any->u;
+}
+
+static ble_gatt_chr_flags chr_flags(const ble_profile_chr_t *chr) {
+    ble_gatt_chr_flags flags = 0;
+
+    if (chr->props & BLE_CHR_PROP_WRITE) {
+        flags |= BLE_GATT_CHR_F_WRITE;
+    }
+    if (chr->props & BLE_CHR_PROP_WRITE_NO_RSP) {
+        flags |= BLE_GATT_CHR_F_WRITE_NO_RSP;
+    }
+    if (chr->props & BLE_CHR_PROP_NOTIFY) {
+        flags |= BLE_GATT_CHR_F_NOTIFY;
+    }
+
+    /*
+     * The control characteristic switches a link's grammar, so it is always
+     * encrypted, whatever the mode. The data characteristics are not: their
+     * check is link_usable(), made per access. Without a READ_ENC on a
+     * notify-only characteristic an unencrypted peer can subscribe, but it
+     * has nothing to hear - replies only come from writes, and those are
+     * refused.
+     */
+    if (chr->role == BLE_CHR_CTRL) {
+        flags |= BLE_GATT_CHR_F_WRITE_ENC | BLE_GATT_CHR_F_READ_ENC;
+    }
+
+    return flags;
+}
+
+static int gatt_table_add_chr(struct ble_gatt_chr_def *out,
+                              const ble_profile_chr_t *chr, uint8_t profile) {
+    ble_slot_t *slot;
+
+    if (g_slot_count >= BLE_SLOT_MAX) {
+        return -1;
+    }
+
+    out->uuid = uuid_make(&chr->uuid);
+    if (!out->uuid) {
+        return -1;
+    }
+
+    slot = &g_slots[g_slot_count++];
+    slot->def = chr;
+    slot->profile = profile;
+    slot->handle = 0;
+
+    out->access_cb = gatt_svr_access_cb;
+    out->arg = slot;
+    out->flags = chr_flags(chr);
+    out->val_handle = &slot->handle;
+
+    if (profile == BLE_SLOT_CTRL) {
+        g_ctrl_slot = slot;
+    }
+    return 0;
+}
+
+static int gatt_table_build(void) {
+    const ble_ctrl_service_t *ctrl = ble_profile_ctrl();
+    int n = 0;
+
+    g_uuid_count = 0;
+    g_slot_count = 0;
+    memset(g_chr_defs, 0, sizeof(g_chr_defs));
+    memset(g_svc_defs, 0, sizeof(g_svc_defs));
+
+    for (int i = 0; i < BLE_PROFILE_COUNT; i++) {
+        const ble_profile_t *p = ble_profile_get((ble_profile_id_t)i);
+
+        g_svc_defs[n].type = BLE_GATT_SVC_TYPE_PRIMARY;
+        g_svc_defs[n].uuid = uuid_make(&p->service);
+        g_svc_defs[n].characteristics = g_chr_defs[i];
+        if (!g_svc_defs[n].uuid) {
+            return -1;
+        }
+
+        for (int c = 0; c < p->num_chrs; c++) {
+            if (gatt_table_add_chr(&g_chr_defs[i][c], &p->chrs[c],
+                                   (uint8_t)i) != 0) {
+                return -1;
+            }
+        }
+        n++;
+    }
+
+    g_svc_defs[n].type = BLE_GATT_SVC_TYPE_PRIMARY;
+    g_svc_defs[n].uuid = uuid_make(&ctrl->service);
+    g_svc_defs[n].characteristics = g_chr_defs[BLE_PROFILE_COUNT];
+    if (!g_svc_defs[n].uuid ||
+        gatt_table_add_chr(&g_chr_defs[BLE_PROFILE_COUNT][0], &ctrl->chr,
+                           BLE_SLOT_CTRL) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/** The slot holding the notify characteristic of @p profile, or NULL. */
+static const ble_slot_t *slot_for_tx(uint8_t profile) {
+    for (int i = 0; i < g_slot_count; i++) {
+        if (g_slots[i].profile == profile && ble_chr_is_tx(g_slots[i].def)) {
+            return &g_slots[i];
+        }
+    }
+    return NULL;
+}
 
 static void nimble_host_task(void *param) {
     ESP_LOGI(TAG, "nimble host task has been started!");
@@ -591,10 +743,10 @@ static int gap_init(void) {
     ble_svc_gap_init();
 
     /* Set GAP device name */
-    rc = ble_svc_gap_device_name_set(DEVICE_NAME);
+    rc = ble_svc_gap_device_name_set(g_gap_name);
     if (rc != 0) {
         ESP_LOGE(TAG, "failed to set device name to %s, error code: %d",
-                 DEVICE_NAME, rc);
+                 g_gap_name, rc);
         return rc;
     }
 
@@ -612,12 +764,17 @@ int gatt_svc_init(void) {
 
     ble_svc_gatt_init();
 
-    rc = ble_gatts_count_cfg(gatt_svr_svcs);
+    rc = gatt_table_build();
     if (rc != 0) {
         return rc;
     }
 
-    rc = ble_gatts_add_svcs(gatt_svr_svcs);
+    rc = ble_gatts_count_cfg(g_svc_defs);
+    if (rc != 0) {
+        return rc;
+    }
+
+    rc = ble_gatts_add_svcs(g_svc_defs);
     if (rc != 0) {
         return rc;
     }
@@ -670,6 +827,28 @@ static void conn_params_request(uint16_t handle) {
 }
 
 /*
+ * The link is fit for ELM traffic: tell main, once per connection.
+ *
+ * Until now a connect was announced the moment it happened, and the data link
+ * was bound to a peer that could not yet write a byte. STRICT waits for the
+ * link to be encrypted; COMPAT has nothing to wait for. Either way the
+ * transport is only reported as connected from here, so USB is not shut out
+ * by a phone that never finishes pairing.
+ */
+static void ble_link_ready(uint16_t handle) {
+    if (g_session_open) {
+        return;
+    }
+
+    conn_handle = handle;
+    connected = 1;
+    g_session_open = true;
+    if (ble_conn_callback) {
+        ble_conn_callback(true);
+    }
+}
+
+/*
  * NimBLE applies an event-driven model to keep GAP service going
  * gap_event_handler is a callback function registered when calling
  * ble_gap_adv_start API and called when a GAP event arrives
@@ -716,10 +895,17 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
                 return 0;
             }
 
-            connected = 1;
             conn_handle = event->connect.conn_handle;
+            g_conn_sec_mode = g_sec_mode;
+            g_active_profile = BLE_PROFILE_NUS;
 
-            if (!desc.sec_state.encrypted) {
+            if (g_conn_sec_mode == BLE_SEC_COMPAT) {
+                /* No pairing is asked for: an app that cannot pair would be
+                 * left staring at a prompt it has no way to answer. A phone
+                 * that wants to encrypt still may. */
+                conn_params_request(event->connect.conn_handle);
+                ble_link_ready(event->connect.conn_handle);
+            } else if (!desc.sec_state.encrypted) {
                 rc = ble_gap_security_initiate(event->connect.conn_handle);
                 if (rc != 0 && rc != BLE_HS_EALREADY) {
                     ESP_LOGW(TAG, "could not start pairing, error code: %d",
@@ -727,11 +913,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
                 }
                 rc = 0;
             }
-
-            if (ble_conn_callback) {
-                g_session_open = true;
-                ble_conn_callback(true);
-            }
+            /* STRICT: the link is not ready until ENC_CHANGE says so. */
         }
         /* The attempt failed; put the advertisement back. */
         else {
@@ -746,6 +928,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
                  event->disconnect.reason);
 
         connected = 0;
+        g_active_profile = BLE_PROFILE_NUS;
         if (g_conn_count > 0) {
             g_conn_count--;
         }
@@ -801,9 +984,20 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
             }
 
             conn_params_request(event->enc_change.conn_handle);
+
+            /* Only now is it a session worth binding the ELM327 link to. */
+            ble_link_ready(event->enc_change.conn_handle);
         } else {
             ESP_LOGW(TAG, "link not encrypted; status=0x%03x",
                      event->enc_change.status);
+            if (g_conn_sec_mode == BLE_SEC_COMPAT) {
+                /* Compat already opened the session without encryption. A
+                 * phone that still holds an old bond often tears the link
+                 * itself (MIC / key missing). Forget OpenDIAG on the phone. */
+                ESP_LOGW(TAG, "compat: encryption failed; if the phone drops "
+                              "the link, forget this device in its Bluetooth "
+                              "settings and reconnect");
+            }
         }
         return 0;
 
@@ -849,6 +1043,17 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
         print_conn_desc(&desc);
         return rc;
 
+    /* A client turned notifications on or off: that is the door it chose. */
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        for (int i = 0; i < g_slot_count; i++) {
+            if (g_slots[i].handle == event->subscribe.attr_handle &&
+                g_slots[i].profile != BLE_SLOT_CTRL &&
+                ble_chr_is_tx(g_slots[i].def) && event->subscribe.cur_notify) {
+                g_active_profile = g_slots[i].profile;
+            }
+        }
+        return 0;
+
     case BLE_GAP_EVENT_ADV_COMPLETE:
         ESP_LOGI(TAG, "advertising ended; reason=%d",
                  event->adv_complete.reason);
@@ -864,7 +1069,15 @@ static int adv_set_payload(ble_adv_state_t state) {
     struct ble_hs_adv_fields rsp_fields = {0};
     const char *name = ble_svc_gap_device_name();
     bool named_in_adv = (state != BLE_ADV_LOCKED);
+    ble_uuid16_t svc16[BLE_PROFILE_COUNT];
+    uint16_t raw16[BLE_PROFILE_COUNT];
+    ble_uuid_any_t nus;
+    size_t n16 = ble_profile_adv_uuid16s(raw16, BLE_PROFILE_COUNT);
     int rc;
+
+    for (size_t i = 0; i < n16; i++) {
+        svc16[i] = (ble_uuid16_t)BLE_UUID16_INIT(raw16[i]);
+    }
 
     adv_fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
 
@@ -883,7 +1096,21 @@ static int adv_set_payload(ble_adv_state_t state) {
     adv_fields.le_role = BLE_GAP_LE_ROLE_PERIPHERAL;
     adv_fields.le_role_is_present = 1;
 
+    /*
+     * The short UUIDs apps scan for. A 31 byte advertisement is tight: flags,
+     * the name, power, appearance and role leave exactly eight bytes, which is
+     * these three. If a longer name ever tips it over, the transmit power is
+     * what goes - nothing scans for that.
+     */
+    adv_fields.uuids16 = svc16;
+    adv_fields.num_uuids16 = (uint8_t)n16;
+    adv_fields.uuids16_is_complete = 1;
+
     rc = ble_gap_adv_set_fields(&adv_fields);
+    if (rc == BLE_HS_EMSGSIZE) {
+        adv_fields.tx_pwr_lvl_is_present = 0;
+        rc = ble_gap_adv_set_fields(&adv_fields);
+    }
     if (rc != 0) {
         ESP_LOGE(TAG, "failed to set advertising data, error code: %d", rc);
         return rc;
@@ -896,13 +1123,19 @@ static int adv_set_payload(ble_adv_state_t state) {
     }
 
     /*
-     * The service the data characteristics live in. It was advertised nowhere
-     * before, which left an app that scans by service - as an iOS app must, to
-     * scan in the background at all - unable to find this adapter.
+     * The Nordic UART service, which does not fit alongside the rest. It was
+     * advertised nowhere at first, which left an app that scans by service -
+     * as an iOS app must, to scan in the background at all - unable to find
+     * this adapter.
      */
-    rsp_fields.uuids128 = (ble_uuid128_t *)&gatt_svr_svc_uart_uuid;
-    rsp_fields.num_uuids128 = 1;
-    rsp_fields.uuids128_is_complete = 1;
+    if (ble_profile_get(BLE_PROFILE_NUS)->service.len == 16 &&
+        ble_uuid_init_from_buf(&nus,
+                               ble_profile_get(BLE_PROFILE_NUS)->service.bytes,
+                               16) == 0) {
+        rsp_fields.uuids128 = &nus.u128;
+        rsp_fields.num_uuids128 = 1;
+        rsp_fields.uuids128_is_complete = 1;
+    }
 
     rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
     if (rc != 0) {
@@ -1043,6 +1276,27 @@ static void on_stack_reset(int reason) {
 
 static void on_stack_sync(void) { adv_init(); }
 
+/*
+ * Compat exists for apps that cannot pair. Keep the stack from offering a
+ * bond in that mode so a phone is not nudged into encrypting a link that is
+ * meant to stay open. Strict still bonds as before.
+ *
+ * Applied at host init (after NVS load) and whenever the mode changes.
+ */
+static void ble_sm_apply_mode(ble_sec_mode_t mode) {
+    if (mode == BLE_SEC_COMPAT) {
+        ble_hs_cfg.sm_bonding = 0;
+        ble_hs_cfg.sm_our_key_dist = 0;
+        ble_hs_cfg.sm_their_key_dist = 0;
+    } else {
+        ble_hs_cfg.sm_bonding = 1;
+        ble_hs_cfg.sm_our_key_dist =
+            BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+        ble_hs_cfg.sm_their_key_dist =
+            BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    }
+}
+
 static void nimble_host_config_init(void) {
     /* Set host callbacks */
     ble_hs_cfg.reset_cb = on_stack_reset;
@@ -1050,13 +1304,9 @@ static void nimble_host_config_init(void) {
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
 
     ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
-    ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_mitm = 0;
     ble_hs_cfg.sm_sc = 1;
-    ble_hs_cfg.sm_our_key_dist =
-        BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
-    ble_hs_cfg.sm_their_key_dist =
-        BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_sm_apply_mode(g_sec_mode);
 
     ble_store_config_init();
 }
@@ -1155,13 +1405,16 @@ void ble_uart_get_rx_stats(uint32_t *bytes, uint32_t *widest,
 }
 
 void ble_uart_send(const char *buffer, size_t size) {
+    const ble_slot_t *tx = slot_for_tx(g_active_profile);
+
     ble_trace('>', (const uint8_t *)buffer, size);
-    ble_notify_chunked(g_bleuart_attr_read_handle, buffer, size);
+    ble_notify_chunked(tx ? tx->handle : 0, buffer, size);
 }
 
 void ble_uart_ctrl_reply(const char *text) {
     if (text) {
-        ble_notify_chunked(g_blectrl_attr_handle, text, strlen(text));
+        ble_notify_chunked(g_ctrl_slot ? g_ctrl_slot->handle : 0, text,
+                           strlen(text));
     }
 }
 
@@ -1173,9 +1426,103 @@ void ble_uart_set_conn_callback(ble_uart_conn_cb_t cb) {
     ble_conn_callback = cb;
 }
 
+/* What a reboot should find: the mode and the name last asked for. */
+static void ble_config_load(void) {
+    nvs_handle_t h;
+    uint8_t sec = BLE_SEC_STRICT;
+    char name[16];
+    size_t len = sizeof(name);
+
+    /* A unit that was never configured has no namespace yet: the defaults
+     * stand, and STRICT is the default. */
+    if (nvs_open(BLE_CFG_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+
+    if (nvs_get_u8(h, BLE_CFG_KEY_SEC, &sec) == ESP_OK &&
+        sec == BLE_SEC_COMPAT) {
+        g_sec_mode = BLE_SEC_COMPAT;
+    }
+
+    if (nvs_get_str(h, BLE_CFG_KEY_NAME, name, &len) == ESP_OK) {
+        const char *known = ble_profile_gap_name_find(name);
+
+        if (known) {
+            g_gap_name = known;
+        }
+    }
+
+    nvs_close(h);
+    ESP_LOGI(TAG, "security: %s, name: %s", ble_sec_mode_name(g_sec_mode),
+             g_gap_name);
+}
+
+static esp_err_t ble_config_save(const char *key, uint8_t sec,
+                                 const char *name) {
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(BLE_CFG_NAMESPACE, NVS_READWRITE, &h);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = name ? nvs_set_str(h, key, name) : nvs_set_u8(h, key, sec);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+
+    nvs_close(h);
+    return err;
+}
+
+ble_sec_mode_t ble_uart_security_mode(void) { return g_sec_mode; }
+
+esp_err_t ble_uart_set_security_mode(ble_sec_mode_t mode) {
+    esp_err_t err;
+
+    if (mode != BLE_SEC_STRICT && mode != BLE_SEC_COMPAT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    g_sec_mode = mode;
+    ble_sm_apply_mode(mode);
+    ESP_LOGI(TAG, "security mode: %s", ble_sec_mode_name(mode));
+
+    /* Compat is a different advertisement: one that needs no button. */
+    ble_job_post(BLE_JOB_ADV_REFRESH);
+
+    err = ble_config_save(BLE_CFG_KEY_SEC, (uint8_t)mode, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "security mode not saved: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+const char *ble_uart_gap_name(void) { return g_gap_name; }
+
+esp_err_t ble_uart_set_gap_name(const char *name) {
+    const char *known = ble_profile_gap_name_find(name);
+    esp_err_t err;
+
+    if (!known) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    g_gap_name = known;
+    ble_job_post(BLE_JOB_APPLY_NAME | BLE_JOB_ADV_REFRESH);
+
+    err = ble_config_save(BLE_CFG_KEY_NAME, 0, known);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "name not saved: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
 void ble_uart_setup(void) {
     esp_err_t ret;
     int rc;
+
+    ble_config_load();
 
     /* NimBLE stack initialization */
     ret = nimble_port_init();

@@ -2,6 +2,8 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#include "esp_err.h"
+#include "ble_profiles.h"
 #include "common.h"
 #include "sdkconfig.h"
 
@@ -75,7 +77,14 @@ void ble_uart_ctrl_reply(const char *text);
  */
 typedef void (*ble_uart_ctrl_cb_t)(const char *cmd, size_t len);
 
-/* A central connected or went away. */
+/**
+ * A central's link became usable, or went away.
+ *
+ * @p connected is true only once the link is ready for ELM traffic: in STRICT
+ * when it has been encrypted, in COMPAT as soon as it is up. A phone that
+ * connects and never finishes pairing is never reported, so it cannot take the
+ * data link from USB.
+ */
 typedef void (*ble_uart_conn_cb_t)(bool connected);
 
 void ble_uart_ctrl_set_callback(ble_uart_ctrl_cb_t cb);
@@ -100,6 +109,9 @@ typedef enum {
     /** The window is open. Named, unfiltered: any phone may see it and bond. */
     BLE_ADV_PAIRABLE,
 
+    /** COMPAT mode: named, unfiltered, with no button needed. */
+    BLE_ADV_OPEN,
+
     /** Bonded phones only. The name moves to the scan response, which the
      *  accept list withholds from everybody else, so a stranger's scan turns
      *  up a nameless device it cannot connect to. */
@@ -113,3 +125,27 @@ typedef enum {
 
 ble_adv_state_t ble_uart_adv_state(void);
 const char *ble_adv_state_name(ble_adv_state_t state);
+/** @brief The security mode in force for the next connection. */
+ble_sec_mode_t ble_uart_security_mode(void);
+
+/**
+ * @brief Choose STRICT or COMPAT, and remember the choice across reboots.
+ *
+ * Takes effect for the next connection. A link already up keeps the rules it
+ * was admitted under.
+ *
+ * @return ESP_OK, or the NVS error when it could not be saved - in which case
+ *         the mode is still changed, until the next reboot.
+ */
+esp_err_t ble_uart_set_security_mode(ble_sec_mode_t mode);
+
+/** @brief The GAP name the adapter advertises. */
+const char *ble_uart_gap_name(void);
+
+/**
+ * @brief Choose the GAP name: "OpenDIAG" or "OBDII". Remembered across reboots.
+ *
+ * @return ESP_OK; ESP_ERR_INVALID_ARG for any other name; or the NVS error
+ *         when it could not be saved.
+ */
+esp_err_t ble_uart_set_gap_name(const char *name);
