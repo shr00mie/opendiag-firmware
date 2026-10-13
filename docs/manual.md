@@ -211,18 +211,23 @@ whether one is connected. `ble pair` opens the pairing window from the shell.
 
 ### For app developers: GATT layout
 
-One primary service carries three characteristics. It follows the Nordic UART layout, plus a
-control characteristic.
+The adapter exposes several BLE serial profiles that all carry the same ELM327 byte stream, so apps
+that look for Vgate-, Veepeak-, or Nordic-style UUIDs can find a write/notify pair. Control lives in
+a separate OpenDIAG service (not on Nordic UART).
 
-| UUID | Properties | Purpose |
-| --- | --- | --- |
-| `6E400001-B5A3-F393-E0A9-E50E24DCCA9E` | service | |
-| `6E400002-B5A3-F393-E0A9-E50E24DCCA9E` | write, write without response | Data, app → adapter |
-| `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` | notify | Data, adapter → app |
-| `6E400004-B5A3-F393-E0A9-E50E24DCCA9E` | write, write without response, notify | [Control commands](#control-commands) |
+| Profile | Service | Write | Notify |
+| --- | --- | --- | --- |
+| Nordic UART | `6E400001-…` | `6E400002-…` | `6E400003-…` |
+| Vgate-style | `FFE0` | `FFE1` | `FFE1` |
+| Veepeak-style | `FFF0` | `FFF1` | `FFF2` |
+| OBDLink-style | `18F0` | `2AF1` | `2AF0` |
+| OpenDIAG control | `7D1A6C01-6F70-656E-6469-61672D637472` | `…6C02…` | `…6C02…` |
 
-All three characteristics need an encrypted, bonded connection. Notifications are split to fit the
-negotiated MTU, so request a larger MTU for better throughput.
+In the default **strict** security mode, data and control need an encrypted, bonded connection. The
+shell command `ble compat on` opens a looser mode for app bring-up. Notifications are split to fit
+the negotiated MTU, so request a larger MTU for better throughput.
+
+`ble name OpenDIAG|OBDII` sets the advertised GAP name (default **OpenDIAG**).
 
 ---
 
@@ -270,6 +275,8 @@ These commands aren't part of the ELM327 set:
 | `AT PROGV p vvvvvvvv` | Drive OBD-II pin `p` (one hex digit: `6`, `9`, `B`=11 … `F`=15). `vvvvvvvv` is the voltage in millivolts, in hex, for example `00002EE0` for 12 V. `FFFFFFFE` grounds a low-side pin, and `FFFFFFFF` releases the pin. |
 | `AT VIF PASSTHRU` | Switch the link to J2534 mode. The J2534 driver sends this for you. |
 | `AT VIF SLCAN` | Switch the link to SLCAN mode. |
+| `AT VIF EDIABAS` | Switch the link to Deep OBD / Ediabas DS2 mode. |
+| `AT VIF KDCAN` | Switch the link to transparent K+DCAN UART mode (BMWeb). |
 
 ---
 
@@ -362,16 +369,47 @@ The adapter refuses other rates rather than substituting a nearby one.
 
 ---
 
+## Ediabas / Deep OBD mode (E46 DS2)
+
+`mode ediabas` switches the data link to the Deep OBD / CanAdapterElm binary protocol so
+EdiabasLib, Deep OBD, and INPA/Tool32 (via EdiabasLib) can talk BMW **DS2** on K-Line.
+
+```
+link usb          # or: link ble
+mode ediabas
+```
+
+Then open the **data** port in the host software at 115200 baud. E46 body modules need OBD pins
+**7 and 8 bridged** in hardware. Details, scope, and a smoke checklist are in
+[ediabas.md](ediabas.md).
+
+---
+
+## K+DCAN UART mode (BMWeb)
+
+`mode kdcan` bridges the USB **data** port to K-Line as a transparent UART (baud/parity via
+CDC line coding, break via Send_Break), for browser tools such as BMWeb. Prefer USB and open
+`*-if00` (COM), not DEBUG. DTR idle does not drop the session. Details are in
+[kdcan.md](kdcan.md).
+
+```
+link usb
+mode kdcan
+```
+
+---
+
 ## Switching modes
 
-The data link runs one of three modes at a time: **elm327** (the default), **j2534**, or
-**slcan**.
+The data link runs one mode at a time: **elm327** (the default), **j2534**,
+**slcan**, **ediabas** (Deep OBD / E46 DS2 — see [ediabas.md](ediabas.md)), or
+**kdcan** (K+DCAN UART — see [kdcan.md](kdcan.md)).
 
 | From | How to switch |
 | --- | --- |
-| Debug shell | `mode <name>`, for example `mode slcan` |
+| Debug shell | `mode <name>`, for example `mode slcan`, `mode ediabas`, or `mode kdcan` |
 | BLE control characteristic | `MODE=<name>` |
-| Inside ELM327 | `AT VIF PASSTHRU` or `AT VIF SLCAN` |
+| Inside ELM327 | `AT VIF PASSTHRU`, `AT VIF SLCAN`, `AT VIF EDIABAS`, or `AT VIF KDCAN` |
 
 Keep in mind:
 
@@ -423,11 +461,13 @@ for the list of commands.
 | `link` | Show which transport holds the data link |
 | `link usb` / `link ble` / `link drop` | Hand the data link to USB or Bluetooth, or let go of it |
 | `mode` | Show the current mode, the default, and every available mode |
-| `mode <name>` | Switch mode, for example `mode slcan` |
+| `mode <name>` | Switch mode, for example `mode slcan`, `mode ediabas`, or `mode kdcan` |
 | `ctrl <command>` | Run a [control command](#control-commands) |
-| `ble` | Show pairing status |
+| `ble` | Show pairing status, GAP name, and security mode |
 | `ble pair` | Open the Bluetooth pairing window |
 | `ble forget` | Forget every paired phone |
+| `ble compat on|off` | Loosen or restore BLE security for app bring-up |
+| `ble name OpenDIAG|OBDII` | Set the advertised Bluetooth name |
 | `vif` | Show open buses, energised pins, and who holds each |
 | `vbatt` | Show the vehicle battery voltage |
 | `reboot` | Restart the adapter |

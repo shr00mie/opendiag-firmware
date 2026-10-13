@@ -16,6 +16,8 @@ direct control over the connector's pins.
 | **OBD-II apps** | ELM327-compatible over USB or Bluetooth LE. Works with any app that supports a BLE or USB ELM327 adapter. |
 | **J2534 pass-thru** | 32-bit Windows driver, API 05.00 and 04.04, for diagnostic and reprogramming software. |
 | **SLCAN** | Raw CAN for SocketCAN (`slcand`), SavvyCAN, python-can and similar tools. |
+| **Ediabas / Deep OBD** | Binary DS2 mode for E46 (and similar) via Deep OBD / EdiabasLib — see [ediabas.md](ediabas.md). |
+| **K+DCAN UART** | Transparent K-Line UART for BMWeb and similar hosts — see [kdcan.md](kdcan.md). |
 | **Vehicle buses** | CAN (ISO 15765-4), K-Line and L-Line (ISO 9141-2, ISO 14230-4 KWP), SAE J1850 PWM and VPW. |
 | **Pin control** | Programming voltage from 5 V to 20 V on OBD-II pins 6, 9, 11–14, and a low-side switch on pin 15. |
 
@@ -40,6 +42,8 @@ drivers or tools to install.
 - [Firmware update](update/index.html): install the latest firmware from your browser.
 - [User manual](manual.md): setup, modes, the debug shell, firmware updates, and troubleshooting.
 - [ELM327 commands](at_commands.md): which AT commands are supported.
+- [Ediabas / Deep OBD mode](ediabas.md): E46 DS2 with Deep OBD and EdiabasLib.
+- [K+DCAN UART mode](kdcan.md): BMWeb-style raw K-Line over the USB data port.
 
 ## Related projects
 
