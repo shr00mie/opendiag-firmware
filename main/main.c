@@ -271,11 +271,7 @@ static void usb_line_state_changed(int itf, bool connected) {
  * stranger driving past cannot do is stand at the car and press a button, so
  * that press is what a new phone needs before it is allowed to bond.
  */
-/**
- * @brief Short tap: cycle the sticky link mode.
- *
- * Order follows registration: elm327 → slcan → j2534 → ediabas → …
- */
+/** Short tap cycles the sticky link mode in registration order. */
 static void button_tapped(void) {
     const char *now = vif_link_frontend_name();
     const vif_frontend_t *next = NULL;
@@ -315,10 +311,8 @@ static void button_held(void) { ble_uart_open_pairing_window(); }
 static void button_held_long(void) { ble_uart_forget_bonds(); }
 
 /**
- * @brief The BLE transport has a client that is ready, or has lost it.
- *
- * "Ready" is the transport's call: an encrypted link in STRICT, any link in
- * COMPAT. A phone that is merely connected is not reported, so one that never
+ * "Ready" is the transport's call: encrypted in STRICT, any link in COMPAT.
+ * A phone that is merely connected is not reported, so one that never
  * finishes pairing cannot hold the link against USB.
  */
 static void ble_conn_changed(bool connected) {
