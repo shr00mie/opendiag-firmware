@@ -22,8 +22,16 @@
 #define USB_CDC_INTERFACE_NUM 2
 
 static volatile bool line_status[USB_CDC_INTERFACE_NUM];
+static bool last_dtr[USB_CDC_INTERFACE_NUM];
+static bool last_rts[USB_CDC_INTERFACE_NUM];
 static usb_cdc_rx_cb_t rx_callback[USB_CDC_INTERFACE_NUM];
 static usb_cdc_line_cb_t line_callback;
+static usb_cdc_line_coding_cb_t line_coding_callback;
+static usb_cdc_break_cb_t break_callback;
+
+/* Data-interface session latch (see usb_cdc_session_latch_enable). */
+static bool session_latch_enabled;
+static volatile bool session_latched;
 
 enum {
     ITF_NUM_CDC_0 = 0,
@@ -128,26 +136,70 @@ static const tinyusb_config_t tusb_cfg = {
 };
 
 /**
+ * @brief Raise the data-interface session latch; notify on the rising edge.
+ */
+static void session_latch_set(void) {
+    bool was = session_latched;
+    session_latched = true;
+    if (!was && line_callback) {
+        line_callback(USB_CDC_INTERFACE_DATA, true);
+    }
+}
+
+/**
  * @brief Invoked when a line state change event occurs
  *
  * This callback is used to detect when a serial terminal is connected or
- * disconnected.
+ * disconnected. With session latch enabled on the data interface, any
+ * line-state change latches the session; DTR+RTS both low does not clear it.
  */
 static void tinyusb_cdc_line_state_cb(int itf, cdcacm_event_t *event) {
-    bool open = false;
+    bool dtr = event->line_state_changed_data.dtr;
+    bool rts = event->line_state_changed_data.rts;
+    bool open = dtr && rts;
 
-    if (event->line_state_changed_data.dtr &&
-        event->line_state_changed_data.rts) {
+    if (itf < USB_CDC_INTERFACE_NUM) {
+        last_dtr[itf] = dtr;
+        last_rts[itf] = rts;
+        line_status[itf] = open;
+    }
+
+    if (itf == USB_CDC_INTERFACE_DATA && session_latch_enabled) {
+        ESP_LOGI(TAG,
+                 "CDC%d line state dtr=%d rts=%d (session latch)", itf,
+                 (int)dtr, (int)rts);
+        session_latch_set();
+        return;
+    }
+
+    if (open) {
         ESP_LOGI(TAG, "Serial terminal connected on CDC interface %d", itf);
-        open = true;
     } else {
         ESP_LOGI(TAG, "Serial terminal disconnected on CDC interface %d", itf);
     }
 
-    line_status[itf] = open;
-
     if (line_callback) {
         line_callback(itf, open);
+    }
+}
+
+/**
+ * @brief Invoked when the host sets line coding (baud / framing).
+ *
+ * With session latch enabled on the data interface, a coding change latches
+ * the session the same way a line-state change does.
+ */
+static void tinyusb_cdc_line_coding_cb(int itf, cdcacm_event_t *event) {
+    cdc_line_coding_t const *lc =
+        event->line_coding_changed_data.p_line_coding;
+
+    if (itf == USB_CDC_INTERFACE_DATA && session_latch_enabled) {
+        session_latch_set();
+    }
+
+    if (line_coding_callback && lc) {
+        line_coding_callback(itf, lc->bit_rate, lc->stop_bits, lc->parity,
+                             lc->data_bits);
     }
 }
 
@@ -170,13 +222,57 @@ static void tinyusb_cdc_rx_cb(int itf, cdcacm_event_t *event) {
         return;
     }
 
+    if (itf == USB_CDC_INTERFACE_DATA && session_latch_enabled && rx_size) {
+        session_latch_set();
+    }
+
     if (rx_callback[itf]) {
         rx_callback[itf](rx_buf, rx_size);
     }
 }
 
+/**
+ * @brief TinyUSB SEND_BREAK (weak symbol). Forwards to the registered callback.
+ *
+ * duration_ms: 0xFFFF assert until cleared, 0 deassert, else break length.
+ */
+void tud_cdc_send_break_cb(uint8_t itf, uint16_t duration_ms) {
+    if (break_callback) {
+        break_callback((int)itf, duration_ms);
+    }
+}
+
+/**
+ * @brief Host unmounted the device: drop line status and clear the latch.
+ */
+void tud_umount_cb(void) {
+    for (int i = 0; i < USB_CDC_INTERFACE_NUM; i++) {
+        bool was_open = line_status[i];
+        line_status[i] = false;
+        last_dtr[i] = false;
+        last_rts[i] = false;
+        if (i == USB_CDC_INTERFACE_DATA) {
+            bool was_latched = session_latched;
+            session_latched = false;
+            if (line_callback && (was_latched || was_open)) {
+                line_callback(i, false);
+            }
+        } else if (was_open && line_callback) {
+            line_callback(i, false);
+        }
+    }
+}
+
 void usb_cdc_set_line_callback(usb_cdc_line_cb_t callback) {
     line_callback = callback;
+}
+
+void usb_cdc_set_line_coding_callback(usb_cdc_line_coding_cb_t callback) {
+    line_coding_callback = callback;
+}
+
+void usb_cdc_set_break_callback(usb_cdc_break_cb_t callback) {
+    break_callback = callback;
 }
 
 void usb_cdc_rx_set_callback(int itf, usb_cdc_rx_cb_t callback) {
@@ -196,7 +292,63 @@ void usb_cdc_tx_flush(int itf) {
 
 bool usb_cdc_get_line_status(int itf) {
     assert(itf < USB_CDC_INTERFACE_NUM);
+    if (itf == USB_CDC_INTERFACE_DATA && session_latch_enabled) {
+        return session_latched;
+    }
     return line_status[itf];
+}
+
+bool usb_cdc_get_line_coding(int itf, uint32_t *bit_rate, uint8_t *stop_bits,
+                             uint8_t *parity, uint8_t *data_bits) {
+    cdc_line_coding_t coding;
+
+    assert(itf < USB_CDC_INTERFACE_NUM);
+    if (!bit_rate || !stop_bits || !parity || !data_bits) {
+        return false;
+    }
+    tud_cdc_n_get_line_coding((uint8_t)itf, &coding);
+    *bit_rate = coding.bit_rate;
+    *stop_bits = coding.stop_bits;
+    *parity = coding.parity;
+    *data_bits = coding.data_bits;
+    return true;
+}
+
+void usb_cdc_session_latch_enable(bool enable) {
+    if (enable == session_latch_enabled) {
+        return;
+    }
+
+    if (enable) {
+        session_latch_enabled = true;
+        /* Already-open port stays connected under latch semantics. */
+        if (line_status[USB_CDC_INTERFACE_DATA]) {
+            session_latched = true;
+        }
+    } else {
+        /*
+         * Quiet: do not fire a disconnect edge. Frontend stop() runs this on
+         * every client-gone restart; a synthetic disconnect would call
+         * vif_link_down() again and loop (kdcan stop ↔ USB release).
+         * Status reverts to DTR&&RTS via get_line_status; real unmount still
+         * notifies through tud_umount_cb.
+         */
+        session_latch_enabled = false;
+        session_latched = false;
+    }
+}
+
+void usb_cdc_session_latch_clear(void) {
+    /* Quiet clear — same reason as enable(false). Explicit link drop already
+     * detaches the port before calling this. */
+    session_latched = false;
+}
+
+void usb_cdc_session_latch_touch(void) {
+    if (!session_latch_enabled) {
+        return;
+    }
+    session_latch_set();
 }
 
 void usb_cdc_setup(void) {
@@ -225,7 +377,8 @@ void usb_cdc_setup(void) {
                                        .callback_rx_wanted_char = NULL,
                                        .callback_line_state_changed =
                                            tinyusb_cdc_line_state_cb,
-                                       .callback_line_coding_changed = NULL};
+                                       .callback_line_coding_changed =
+                                           tinyusb_cdc_line_coding_cb};
     ESP_ERROR_CHECK(tusb_cdc_acm_init(&acm_cfg));
 
     /*
@@ -246,6 +399,15 @@ void usb_cdc_setup(void) {
 
 void usb_cdc_teardown(void) {
     ESP_LOGI(TAG, "USB teardown...");
+
+    session_latched = false;
+    session_latch_enabled = false;
+    for (int i = 0; i < USB_CDC_INTERFACE_NUM; i++) {
+        line_status[i] = false;
+        last_dtr[i] = false;
+        last_rts[i] = false;
+    }
+
     tinyusb_driver_uninstall();
 
     /*
