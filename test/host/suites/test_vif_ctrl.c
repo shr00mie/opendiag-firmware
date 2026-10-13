@@ -140,6 +140,8 @@ TEST(mode_reports_the_grammar_running_now) {
 TEST(mode_switches_the_link) {
     TEST_ASSERT_TRUE(ctrl_ok("MODE=slcan"));
     TEST_ASSERT_EQUAL_STRING("slcan", vif_link_frontend_name());
+    TEST_ASSERT_EQUAL_STRING("slcan", vif_link_default_frontend()->name);
+    TEST_ASSERT_EQUAL_INT(LED_COLOR_GREEN, (int)fake_led_mode_color());
     TEST_ASSERT_EQUAL_STRING("MODE slcan", ctrl("MODE"));
 }
 
@@ -193,7 +195,8 @@ TEST(reset_releases_the_claims_and_restores_the_default) {
     vif_bus_open(VIF_OWNER_LINK, VIF_BUS_CAN, &can500);
     ctrl_ok("MODE=slcan");
 
-    TEST_ASSERT_EQUAL_STRING("RESET elm327", ctrl("RESET"));
+    /* MODE= makes slcan sticky; RESET rebuilds that mode, not boot elm327. */
+    TEST_ASSERT_EQUAL_STRING("RESET slcan", ctrl("RESET"));
 
     /* Unlike a client merely going away, this is an explicit request to let
      * go of the hardware as well as the grammar. */
@@ -201,7 +204,17 @@ TEST(reset_releases_the_claims_and_restores_the_default) {
     TEST_ASSERT_EQUAL_INT(VIF_BUS_NONE,
                           vif_bus_current(VIF_OWNER_LINK, VIF_BUS_CAN));
     TEST_ASSERT_FALSE(fake_can_is_up());
-    TEST_ASSERT_EQUAL_STRING("elm327", vif_link_frontend_name());
+    TEST_ASSERT_EQUAL_STRING("slcan", vif_link_frontend_name());
+}
+
+TEST(mode_set_is_sticky_across_client_leave) {
+    TEST_ASSERT_TRUE(ctrl_ok("MODE=slcan"));
+    TEST_ASSERT_EQUAL_STRING("slcan", vif_link_default_frontend()->name);
+
+    vif_link_down();
+    vif_link_service();
+
+    TEST_ASSERT_EQUAL_STRING("slcan", vif_link_frontend_name());
 }
 
 TEST(reset_leaves_the_shells_claims_alone) {

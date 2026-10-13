@@ -1278,7 +1278,7 @@ static void elm327_at_command_handler(elm327_ctx_t *e, const char *cmd) {
         }
 
         elm327_send_string(e, "OK\r");
-        vif_link_set_frontend(frontend);
+        vif_link_select_frontend(frontend);
         /* The host must wait for the reply before sending the new grammar. */
         e->line.reset_discard = true;
     } else if (strcmp(cmd, "Z") == 0) {

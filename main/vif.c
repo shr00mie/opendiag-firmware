@@ -231,10 +231,9 @@ static esp_err_t bus_driver_down(vif_bus_t bus) {
  * Pins
  * ------------------------------------------------------------------ */
 
-/** Reflect pin state on status LED. */
+/** Reflect pin state on status LED without clearing pairing/error. */
 static void led_refresh_locked(void) {
-    ws2812_led_set_state((g.hs_pin != -1 || g.ls_pin != -1) ? LED_STATE_PIN_LIVE
-                                                            : LED_STATE_IDLE);
+    ws2812_led_set_pin_live(g.hs_pin != -1 || g.ls_pin != -1);
 }
 
 static void hs_release_locked(void) {
@@ -506,6 +505,19 @@ void vif_link_set_frontend(const vif_frontend_t *fe) {
     UNLOCK();
 }
 
+void vif_link_select_frontend(const vif_frontend_t *fe) {
+    if (!fe) {
+        return;
+    }
+
+    LOCK();
+    g.link.fe_default = fe;
+    UNLOCK();
+
+    vif_link_set_frontend(fe);
+    ws2812_led_set_mode_color(ws2812_led_color_for_mode(fe->name));
+}
+
 comm_port_id_t vif_link_port(void) { return g.link.port; }
 
 void vif_link_set_port(comm_port_id_t port) {
@@ -553,7 +565,8 @@ void vif_link_down(void) {
     comm_port_client_gone(g.link.port);
 
     /* Reinstall unconditionally — the departed client's parser state (echo,
-     * headers, line buffer) must not reach the next client. */
+     * headers, line buffer) must not reach the next client. Sticky mode stays
+     * put; only the conversation is torn down. */
     ESP_LOGI(TAG, "link: client gone, restarting %s", want->name);
 
     /*

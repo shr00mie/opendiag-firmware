@@ -867,16 +867,16 @@ TEST(a_pin_group_cannot_do_the_other_groups_job) {
 
 TEST(the_status_led_warns_while_a_connector_pin_is_live) {
     vif_pin_set(VIF_OWNER_LINK, OBD_PIN_HS, VIF_PIN_VOLTAGE, 12000);
-    TEST_ASSERT_EQUAL_INT(LED_STATE_PIN_LIVE, fake_led_state());
+    TEST_ASSERT_EQUAL_INT(LED_OVERLAY_PIN_LIVE, fake_led_overlay());
 
     /* Still live: the low side pin is grounded even after the high side goes.
      */
     vif_pin_set(VIF_OWNER_LINK, OBD_PIN_LS, VIF_PIN_GROUND, 0);
     vif_pin_set(VIF_OWNER_LINK, OBD_PIN_HS, VIF_PIN_OFF, 0);
-    TEST_ASSERT_EQUAL_INT(LED_STATE_PIN_LIVE, fake_led_state());
+    TEST_ASSERT_EQUAL_INT(LED_OVERLAY_PIN_LIVE, fake_led_overlay());
 
     vif_pin_release_all(VIF_OWNER_LINK);
-    TEST_ASSERT_EQUAL_INT(LED_STATE_IDLE, fake_led_state());
+    TEST_ASSERT_EQUAL_INT(LED_OVERLAY_NONE, fake_led_overlay());
 }
 
 /* ------------------------------------------------------------------ *
@@ -905,7 +905,7 @@ TEST(calibration_takes_over_the_callers_own_pins) {
     TEST_ASSERT_FALSE(vif_any_pin_active());
     TEST_ASSERT_EQUAL_INT(0, fake_board_hs_state(OBD_PIN_HS));
     TEST_ASSERT_EQUAL_INT(0, fake_board_ls_state(OBD_PIN_LS));
-    TEST_ASSERT_EQUAL_INT(LED_STATE_IDLE, fake_led_state());
+    TEST_ASSERT_EQUAL_INT(LED_OVERLAY_NONE, fake_led_overlay());
 }
 
 TEST(calibration_is_refused_while_the_other_owner_holds_a_pin) {
@@ -1058,7 +1058,6 @@ TEST(the_table_can_be_walked_and_ends) {
     TEST_ASSERT_EQUAL_INT(2, (int)count);
 }
 
-
 TEST(the_front_end_table_has_room_for_five) {
     static const vif_frontend_t extras[] = {
         {.name = "fe_c"}, {.name = "fe_d"}, {.name = "fe_e"},
@@ -1082,9 +1081,23 @@ TEST(the_link_goes_back_to_its_default_when_the_client_leaves) {
 
     link_down();
 
-    /* An off-the-shelf ELM327 app has to find ELM327 however the link was
-     * last used. */
+    /* A non-sticky set_frontend() does not change the boot default. */
     TEST_ASSERT_EQUAL_STRING("fe_a", vif_link_frontend_name());
+    TEST_ASSERT_EQUAL_INT(1, fe_b.stopped);
+}
+
+TEST(a_sticky_mode_survives_the_client_leaving) {
+    vif_link_select_frontend(&frontend_b);
+    vif_link_service();
+
+    TEST_ASSERT_EQUAL_STRING("fe_b", vif_link_default_frontend()->name);
+
+    link_down();
+
+    /* Session rebuilt on the selected mode, not forced back to boot default. */
+    TEST_ASSERT_EQUAL_STRING("fe_b", vif_link_frontend_name());
+    TEST_ASSERT_EQUAL_STRING("fe_b", vif_link_default_frontend()->name);
+    TEST_ASSERT_TRUE(fe_b.started >= 2);
     TEST_ASSERT_EQUAL_INT(1, fe_b.stopped);
 }
 
@@ -1095,10 +1108,8 @@ TEST(a_client_leaving_gives_up_its_pins_and_gives_up_its_bus) {
 
     link_down();
 
-    /* The grammar goes back to the default, and the hardware goes with the
-     * client: held past its departure it locks the shell out, and nothing is
-     * lost by letting go, because the front-end just restarted at protocol 0
-     * and whatever reconnects reopens what it actually wants. */
+    /* Non-sticky switch: default (fe_a) is rebuilt. Hardware goes with the
+     * client so the shell is not locked out. */
     TEST_ASSERT_EQUAL_STRING("fe_a", vif_link_frontend_name());
     TEST_ASSERT_EQUAL_INT(0, fake_board_hs_state(OBD_PIN_HS));
     TEST_ASSERT_EQUAL_INT(VIF_BUS_NONE,

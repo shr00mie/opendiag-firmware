@@ -180,6 +180,11 @@ void td_setup(void) {
 
     elm_harness_init_once();
 
+    /* A prior AT VIF / MODE= may have made another grammar sticky. Put ELM327
+     * back as the selected default so each test starts as a fresh boot would. */
+    vif_link_select_frontend(&elm327_frontend);
+    vif_link_service();
+
     /* Return the settings to power-on defaults before clearing the fakes, so
      * any bus teardown this triggers is not mistaken for the test's own. */
     elm327_reset(g_elm);

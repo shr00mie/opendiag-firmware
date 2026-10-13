@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 #include <inttypes.h>
 #include <stdio.h>
+#include <strings.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_chip_info.h"
@@ -114,9 +115,13 @@ static void comm_ports_setup(void) {
  * is concerned - refusing that is not vif's business - it simply does not get
  * the link until the first one lets go.
  *
- * The link starts on ELM327 and returns to it when its client goes away, so
- * an off-the-shelf OBD-II app finds what it expects however it was last used.
+ * The link starts on ELM327. The selected mode is sticky across disconnects;
+ * only session state (parser, claims) is rebuilt when a client leaves.
  */
+
+static void link_led_refresh(void) {
+    ws2812_led_set_link_solid(vif_link_port() == g_port_usb_cdc0);
+}
 
 static void link_try_bind(comm_port_id_t port) {
     comm_port_id_t held = vif_link_port();
@@ -126,6 +131,7 @@ static void link_try_bind(comm_port_id_t port) {
     }
 
     vif_link_set_port(port);
+    link_led_refresh();
 }
 
 /**
@@ -143,11 +149,13 @@ static void link_offer_elsewhere(comm_port_id_t just_freed) {
 }
 
 /** Take the link off @p port and pass it on. The client is treated as gone:
- *  its grammar and its claims must not reach whoever comes next. */
+ *  its session state and claims must not reach whoever comes next; the
+ *  selected mode stays put. */
 static void link_hand_back(comm_port_id_t port) {
     vif_link_down();
     vif_link_set_port(COMM_INVALID_PORT_ID);
     link_offer_elsewhere(port);
+    link_led_refresh();
 }
 
 static void link_release(comm_port_id_t port) {
@@ -222,11 +230,16 @@ void link_set(link_transport_t t) {
         /* Named outright, so it wins over first-connected. */
         vif_link_set_port(want);
         ESP_LOGI(TAG, "link: %s by request", link_transport_name(t));
+        link_led_refresh();
         return;
     }
 
+    /* Explicit drop: clear a kdcan-style CDC session latch so DTR-idle
+     * cannot keep the data port "connected" after the user let go. */
+    usb_cdc_session_latch_clear();
     ESP_LOGI(TAG, "link: let go by request");
     link_offer_elsewhere(held);
+    link_led_refresh();
 }
 
 /**
@@ -258,6 +271,34 @@ static void usb_line_state_changed(int itf, bool connected) {
  * stranger driving past cannot do is stand at the car and press a button, so
  * that press is what a new phone needs before it is allowed to bond.
  */
+/**
+ * @brief Short tap: cycle the sticky link mode.
+ *
+ * Order follows registration: elm327 → slcan → j2534 → ediabas → …
+ */
+static void button_tapped(void) {
+    const char *now = vif_link_frontend_name();
+    const vif_frontend_t *next = NULL;
+    size_t i;
+
+    for (i = 0; (next = vif_frontend_at(i)) != NULL; i++) {
+        if (now && strcasecmp(next->name, now) == 0) {
+            next = vif_frontend_at(i + 1);
+            break;
+        }
+    }
+
+    if (!next) {
+        next = vif_frontend_at(0);
+    }
+    if (!next) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "button: mode %s", next->name);
+    vif_link_select_frontend(next);
+}
+
 static void button_held(void) { ble_uart_open_pairing_window(); }
 
 /**
@@ -274,6 +315,8 @@ static void button_held(void) { ble_uart_open_pairing_window(); }
 static void button_held_long(void) { ble_uart_forget_bonds(); }
 
 /**
+ * @brief The BLE transport has a client that is ready, or has lost it.
+ *
  * "Ready" is the transport's call: an encrypted link in STRICT, any link in
  * COMPAT. A phone that is merely connected is not reported, so one that never
  * finishes pairing cannot hold the link against USB.
@@ -312,6 +355,8 @@ static void links_setup(void) {
         return;
     }
 
+    ws2812_led_set_mode_color(ws2812_led_color_for_mode("elm327"));
+
     /*
      * The link binds to whichever transport connects first and is handed back
      * when that one leaves. Both edges are reported by the transports
@@ -327,9 +372,10 @@ static void links_setup(void) {
     } else if (ble_uart_is_connected()) {
         link_try_bind(g_port_ble);
     }
+    link_led_refresh();
 
-    /* Hold down button to enter BLE pairing; keep holding to forget every
-     * phone that has ever paired. */
+    /* Tap cycles modes; hold opens BLE pairing; long-hold forgets bonds. */
+    button_set_click_callback(button_tapped);
     button_set_hold_callback(button_held);
     button_set_long_hold_callback(button_held_long);
 
@@ -402,7 +448,8 @@ void app_main(void) {
 
     /* Setup WS2812 status led */
     ws2812_led_init();
-    ws2812_led_set_state(LED_STATE_IDLE);
+    ws2812_led_set_mode_color(LED_COLOR_CYAN);
+    ws2812_led_set_link_solid(false);
 
     /*
      * Bring the multiplexer and its ports up before the transports, so that a

@@ -25,7 +25,9 @@ TEST(passthru_command_switches_after_reply_and_discards_pipelined_commands) {
     TEST_ASSERT_TRUE(vif_link_service());
     TEST_ASSERT_EQUAL_STRING("j2534", vif_link_frontend_name());
     elm_link_down();
-    TEST_ASSERT_EQUAL_STRING("elm327", vif_link_frontend_name());
+    /* AT VIF makes the mode sticky; disconnect rebuilds j2534, not elm327. */
+    TEST_ASSERT_EQUAL_STRING("j2534", vif_link_frontend_name());
+    TEST_ASSERT_EQUAL_STRING("j2534", vif_link_default_frontend()->name);
 }
 
 TEST(slcan_command_selects_registered_frontend) {

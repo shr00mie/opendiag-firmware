@@ -1394,8 +1394,8 @@ static void link_command(int argc, char **argv) {
  * The USB half of the control plane. There is one data link, so this needs no
  * argument beyond the grammar to put on it:
  *
- *   mode          what it is running, what it falls back to, what it could run
- *   mode <name>   switch it, releasing every claim it held
+ *   mode          what it is running, the sticky default, what it could run
+ *   mode <name>   select it (sticky), releasing every claim it held
  *
  * The switch itself is vif_ctrl_exec(), so the shell and a BLE client cannot
  * disagree about what a mode change does.
@@ -1408,7 +1408,7 @@ static void mode_command(int argc, char **argv) {
         const vif_frontend_t *fe = vif_link_default_frontend();
         const char *now = vif_link_frontend_name();
 
-        printf("Link: %s (default %s)\n", now ? now : "-", fe ? fe->name : "-");
+        printf("Link: %s (sticky %s)\n", now ? now : "-", fe ? fe->name : "-");
 
         printf("Modes:");
         for (size_t i = 0; (fe = vif_frontend_at(i)) != NULL; i++) {
@@ -1505,7 +1505,7 @@ const shell_command_t commands[] = {
     {"link", link_command,
      "Which transport carries the data link. Usage: link [drop|usb|ble]"},
     {"mode", mode_command,
-     "Show or switch the link's grammar. Usage: mode [<name>]"},
+     "Show or select the sticky link grammar. Usage: mode [<name>]"},
     {"ctrl", ctrl_command, "Run a control command. Usage: ctrl <command>"},
     {NULL, NULL, NULL} // End of list marker
 };

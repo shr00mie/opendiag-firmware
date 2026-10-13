@@ -183,8 +183,7 @@ static bool ble_pair_policy_window_open(void) {
 }
 
 static void ble_pair_policy_apply_led(void) {
-    ws2812_led_set_state(ble_pair_policy_window_open() ? LED_STATE_PAIRING
-                                                        : LED_STATE_IDLE);
+    ws2812_led_set_pairing(ble_pair_policy_window_open());
 }
 
 static void ble_pair_policy_open_window(void) {

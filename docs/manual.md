@@ -41,9 +41,21 @@ This manual covers setting up and using the OpenDIAG adapter.
 
 ### Status LED
 
-| LED | Meaning |
+The LED colour shows the selected **mode**. Solid vs breathing shows which **transport** holds the
+data link (or that none does).
+
+| Colour | Mode |
 | --- | --- |
-| Breathing cyan | Normal operation, ready |
+| Cyan | ELM327 |
+| Green | SLCAN |
+| Magenta | J2534 |
+| White | Ediabas / Deep OBD |
+| Blue | K+DCAN UART (`kdcan`) |
+
+| Pattern | Meaning |
+| --- | --- |
+| Solid (mode colour) | USB holds the data link |
+| Breathing (mode colour) | Bluetooth holds the link, or nothing holds it yet |
 | Blinking blue | Bluetooth pairing window is open |
 | Pulsing amber | At least one OBD-II connector pin is energised by the adapter |
 | Off | No power, or the adapter is in firmware-download mode |
@@ -52,6 +64,7 @@ This manual covers setting up and using the OpenDIAG adapter.
 
 | Action | Result |
 | --- | --- |
+| Short tap | Cycles the data-link mode: ELM327 → SLCAN → J2534 → Ediabas → KDCAN → … |
 | Hold for about 2 seconds | Opens the **Bluetooth pairing window** for 60 seconds (LED blinks blue) |
 | Keep holding, to about 10 seconds | **Forgets every paired phone**, and leaves the pairing window open |
 | Hold while plugging in USB | Starts **firmware-download mode** (see [Updating the firmware](#updating-the-firmware)) |
@@ -88,9 +101,10 @@ A computer that keeps the USB data port open therefore locks out a phone. To han
 phone without closing the port, type `link ble` in the [debug shell](#the-debug-shell). To let
 whichever connects next take it, type `link drop`.
 
-Whenever the client holding the link disconnects, the adapter starts over. The link goes back to
-ELM327 mode, its settings are cleared, and every bus and pin that client opened is released. The
-next client always starts from a known state.
+Whenever the client holding the link disconnects, the adapter clears that client's session: settings
+are reset and every bus and pin it opened is released. The **selected mode stays put** (it does not
+jump back to ELM327). Change mode with a button tap, the debug-shell `mode` command, `AT VIF …`, or
+BLE `MODE=`.
 
 ---
 
@@ -190,7 +204,7 @@ that only paired phones can find it or connect to it.
    for 60 seconds.
 3. In your app, connect to **OpenDIAG**. Your phone may ask you to confirm pairing. There's no
    PIN to enter.
-4. The LED returns to cyan once the phone is paired.
+4. The LED returns to the mode colour once the phone is paired.
 
 After that, the phone reconnects on its own without the button. The adapter remembers up to 8
 phones.
@@ -237,7 +251,7 @@ Any app or program that supports an ELM327 adapter should work, over USB or over
 Apps that only support *Bluetooth Classic* ELM327 adapters won't find it. Look for BLE or
 "Bluetooth 4.0" support in the app. The adapter identifies itself as `ELM327 v2.3`.
 
-1. Plug OpenDIAG into the vehicle's OBD-II port. The LED breathes cyan.
+1. Plug OpenDIAG into the vehicle's OBD-II port. The LED breathes cyan (ELM327, no USB link yet).
 2. Over Bluetooth, [pair your phone](#pairing-a-phone) if you haven't already.
 3. Turn the ignition on. You can start the engine if your app requires it.
 4. In your app, choose an ELM327 adapter and select either the data serial port or the
@@ -320,8 +334,8 @@ supported. This is a working subset of J2534, not a certified implementation. SC
    port, then click **Save & Test**.
 
 Your diagnostic software should now list **OpenDIAG** as a pass-thru device. The driver switches
-the adapter into J2534 mode when the software connects, and the adapter goes back to ELM327 when
-it disconnects.
+the adapter into J2534 mode when the software connects. When it disconnects, J2534 mode stays
+selected until you change it (button tap, `mode`, or another switch path).
 
 The configuration utility can also connect over **TCP/IP**, for use with a serial-to-network
 bridge.
@@ -407,6 +421,7 @@ The data link runs one mode at a time: **elm327** (the default), **j2534**,
 
 | From | How to switch |
 | --- | --- |
+| Front-panel button | Short tap cycles ELM327 → SLCAN → J2534 → Ediabas → KDCAN → … |
 | Debug shell | `mode <name>`, for example `mode slcan`, `mode ediabas`, or `mode kdcan` |
 | BLE control characteristic | `MODE=<name>` |
 | Inside ELM327 | `AT VIF PASSTHRU`, `AT VIF SLCAN`, `AT VIF EDIABAS`, or `AT VIF KDCAN` |
@@ -415,9 +430,9 @@ Keep in mind:
 
 - **Switching modes is a fresh start.** Every bus and pin the link holds is released on the way
   through. Set up programming voltages *after* you switch, from the mode that will use them.
-- **The mode reverts when the client disconnects.** Closing the data port or dropping the BLE
-  connection puts the link back in ELM327 mode. That keeps an ordinary OBD app working next time
-  without anyone switching it back.
+- **The mode stays selected when the client disconnects.** Closing the data port or dropping BLE
+  clears that session's settings and claims, but does not force ELM327. Switch explicitly when you
+  want a different grammar.
 - **Switch before you open the port.** Opening the port doesn't reset the mode. `mode slcan`
   followed by starting `slcand` works as expected.
 - **The mode doesn't survive a power cycle.** After a reboot, the link starts in ELM327 mode.
@@ -439,7 +454,7 @@ from two places:
 | `MODE` | `MODE elm327` | Shows the current mode |
 | `MODE=<name>` | `MODE slcan` | Switches mode, releasing every bus and pin the link holds |
 | `BUS` | `BUS can@500000/link` | Lists every open vehicle bus, its bit rate, and who holds it (`link` or `shell`) |
-| `RESET` | `RESET elm327` | Releases the link's buses and pins and goes back to ELM327 |
+| `RESET` | `RESET slcan` | Releases the link's buses and pins and rebuilds the sticky selected mode |
 
 Commands are case-insensitive. A failed command replies with `ERR` and a reason.
 
@@ -466,8 +481,8 @@ for the list of commands.
 | `ble` | Show pairing status, GAP name, and security mode |
 | `ble pair` | Open the Bluetooth pairing window |
 | `ble forget` | Forget every paired phone |
-| `ble compat on|off` | Loosen or restore BLE security for app bring-up |
-| `ble name OpenDIAG|OBDII` | Set the advertised Bluetooth name |
+| `ble compat on\|off` | Loosen or restore BLE security for app bring-up |
+| `ble name OpenDIAG\|OBDII` | Set the advertised Bluetooth name |
 | `vif` | Show open buses, energised pins, and who holds each |
 | `vbatt` | Show the vehicle battery voltage |
 | `reboot` | Restart the adapter |

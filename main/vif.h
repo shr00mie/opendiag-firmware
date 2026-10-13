@@ -145,12 +145,11 @@ bool vif_shell_service(void);
  *
  * The task runs whether or not a client is attached, so that everything below
  * can assume it exists: it is the one thread allowed inside the link's
- * drivers. @p default_fe is installed on its first pass.
+ * drivers. @p default_fe is installed on its first pass and becomes the sticky
+ * mode until vif_link_select_frontend() changes it.
  *
- * The default is what the link falls back to whenever its client detaches, so
- * an off-the-shelf OBD-II app finds what it expects however the link was last
- * used. It is required rather than optional: a link with nothing to fall back
- * to would hand the next client the last one's half-finished conversation.
+ * When a client detaches, the link rebuilds the sticky mode (session state
+ * cleared, claims released) rather than forcing a different grammar.
  */
 esp_err_t vif_link_start(const vif_frontend_t *default_fe);
 
@@ -174,13 +173,25 @@ bool vif_link_service(void);
  * through: a grammar change is a fresh start, and the settings the last one
  * left on a bus mean nothing to the next. A failed bus close delays the
  * replacement until teardown can complete.
+ *
+ * Does not change the sticky default used by vif_link_down(); use
+ * vif_link_select_frontend() for an intentional mode change.
  */
 void vif_link_set_frontend(const vif_frontend_t *fe);
+
+/**
+ * @brief Select a mode and make it the sticky default.
+ *
+ * Used by the shell, button tap, AT VIF, and BLE MODE=. A later
+ * vif_link_down() rebuilds this front-end rather than falling back to
+ * whatever was installed at boot.
+ */
+void vif_link_select_frontend(const vif_frontend_t *fe);
 
 /** @brief Name of the front-end currently installed, or NULL. */
 const char *vif_link_frontend_name(void);
 
-/** @brief The front-end the link reverts to. Set by vif_link_start(). */
+/** @brief The sticky front-end the link reverts to on client leave. */
 const vif_frontend_t *vif_link_default_frontend(void);
 
 /** @brief The transport the link speaks on, or COMM_INVALID_PORT_ID. */
@@ -196,9 +207,10 @@ comm_port_id_t vif_link_port(void);
 void vif_link_set_port(comm_port_id_t port);
 
 /**
- * @brief Client disconnected. Reverts grammar, releases pins and buses.
+ * @brief Client disconnected. Rebuilds the sticky mode; releases pins and buses.
  *
- * Called on port close / BLE drop. Never on connect.
+ * Called on port close / BLE drop. Never on connect. Parser and claims are
+ * cleared so the next client starts clean; the selected mode stays put.
  */
 void vif_link_down(void);
 

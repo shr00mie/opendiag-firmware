@@ -125,7 +125,7 @@ static bool cmd_mode_set(const char *name, char *out, size_t cap) {
     /* Every claim goes with the old grammar; vif drops them on the way. The
      * swap itself lands on the link's task, so this cannot report a grammar
      * that refuses to start; the log is where that shows up. */
-    vif_link_set_frontend(fe);
+    vif_link_select_frontend(fe);
 
     ESP_LOGI(TAG, "link: mode %s", fe->name);
 

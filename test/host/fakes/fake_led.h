@@ -3,9 +3,8 @@
  * @file fake_led.h
  * @brief Test double for main/ws2812_led.c.
  *
- * Only the state matters here: vif drives the LED to warn that a connector pin
- * is energised, and that is the behaviour under test, not the SPI timing of a
- * WS2812.
+ * Only the composition matters here: vif drives pin-live, mode select drives
+ * colour, and that is the behaviour under test, not the SPI timing of a WS2812.
  */
 
 #pragma once
@@ -14,8 +13,14 @@
 
 void fake_led_reset(void);
 
-/** Latest state passed to ws2812_led_set_state(). */
-led_state_t fake_led_state(void);
+uint32_t fake_led_mode_color(void);
+bool fake_led_link_solid(void);
+bool fake_led_pairing(void);
+bool fake_led_pin_live(void);
+bool fake_led_error(void);
 
-/** Times the state actually changed, ignoring repeats of the same state. */
+/** Resolved overlay after the last setter call (pairing > pin-live > error). */
+led_overlay_t fake_led_overlay(void);
+
+/** Times any composition field actually changed. */
 int fake_led_change_count(void);
