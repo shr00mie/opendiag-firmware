@@ -124,18 +124,36 @@ TEST(kdcan_poll_forwards_kline_rx_to_host) {
  * ------------------------------------------------------------------ */
 
 TEST(kdcan_line_coding_updates_baud_and_parity) {
-    /* CDC parity 2 = even. */
+    /* CDC parity 2 = even. Stashed on the CDC callback; applied on poll. */
     fake_usb_cdc_line_coding(USB_CDC_INTERFACE_DATA, 9600, 0, 2, 8);
+    TEST_ASSERT_EQUAL_INT(115200, (int)fake_bus_kline_baud());
 
+    kdcan_frontend.poll();
+
+    TEST_ASSERT_EQUAL_INT(9600, (int)fake_bus_kline_baud());
+    TEST_ASSERT_EQUAL_INT(BUS_PARITY_EVEN, (int)fake_bus_kline_parity());
+}
+
+TEST(kdcan_line_coding_skips_noop_reassert) {
+    fake_usb_cdc_line_coding(USB_CDC_INTERFACE_DATA, 9600, 0, 2, 8);
+    kdcan_frontend.poll();
+    TEST_ASSERT_EQUAL_INT(9600, (int)fake_bus_kline_baud());
+
+    /* Host reasserts the active settings; poll must keep them (no churn). */
+    fake_usb_cdc_line_coding(USB_CDC_INTERFACE_DATA, 9600, 0, 2, 8);
+    kdcan_frontend.poll();
     TEST_ASSERT_EQUAL_INT(9600, (int)fake_bus_kline_baud());
     TEST_ASSERT_EQUAL_INT(BUS_PARITY_EVEN, (int)fake_bus_kline_parity());
 }
 
 TEST(kdcan_break_maps_to_ioctl) {
     fake_usb_cdc_send_break(USB_CDC_INTERFACE_DATA, 0xFFFF);
+    TEST_ASSERT_EQUAL_INT(0, (int)fake_bus_kline_break());
+    kdcan_frontend.poll();
     TEST_ASSERT_EQUAL_INT(1, (int)fake_bus_kline_break());
 
     fake_usb_cdc_send_break(USB_CDC_INTERFACE_DATA, 0);
+    kdcan_frontend.poll();
     TEST_ASSERT_EQUAL_INT(0, (int)fake_bus_kline_break());
 }
 

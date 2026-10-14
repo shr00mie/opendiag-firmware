@@ -27,6 +27,11 @@ typedef struct {
     uint32_t bit_rate;
     uint8_t parity;
     uint8_t data_bits;
+    /* Last settings successfully pushed to K-Line (link task only). */
+    bool applied_valid;
+    uint32_t applied_bit_rate;
+    uint8_t applied_parity;
+    uint8_t applied_data_bits;
     bool break_dirty;
     bool break_assert;
 } kdcan_ctx_t;
@@ -65,7 +70,13 @@ static char kdcan_parity_letter(uint8_t cdc_parity) {
     }
 }
 
-/** Push cached CDC line coding onto K-Line; leave dirty on failure to retry. */
+/** Effective baud for a stashed CDC bit_rate (0 → default). */
+static uint32_t kdcan_effective_rate(uint32_t bit_rate) {
+    return bit_rate ? bit_rate : KDCAN_DEFAULT_BAUD;
+}
+
+/** Push cached CDC line coding onto K-Line; leave dirty on failure to retry.
+ *  Must run on the link task (vif_bus_param_set requires the owner thread). */
 static void kdcan_flush_coding(void) {
     int rc_rate = 0;
     int rc_par = 0;
@@ -76,7 +87,14 @@ static void kdcan_flush_coding(void) {
         return;
     }
 
-    rate = g_kd.bit_rate ? g_kd.bit_rate : KDCAN_DEFAULT_BAUD;
+    rate = kdcan_effective_rate(g_kd.bit_rate);
+    if (g_kd.applied_valid && g_kd.applied_bit_rate == rate &&
+        g_kd.applied_parity == g_kd.parity &&
+        g_kd.applied_data_bits == g_kd.data_bits) {
+        g_kd.coding_dirty = false;
+        return;
+    }
+
     rc_rate = vif_bus_param_set(VIF_OWNER_LINK, VIF_BUS_KLINE, BUS_P_DATA_RATE,
                                 rate);
     rc_par = vif_bus_param_set(VIF_OWNER_LINK, VIF_BUS_KLINE, BUS_P_PARITY,
@@ -93,6 +111,10 @@ static void kdcan_flush_coding(void) {
     }
 
     g_kd.coding_dirty = false;
+    g_kd.applied_valid = true;
+    g_kd.applied_bit_rate = rate;
+    g_kd.applied_parity = g_kd.parity;
+    g_kd.applied_data_bits = g_kd.data_bits;
     ESP_LOGI(TAG, "K-Line %lu 8%c1 (CDC line coding)", (unsigned long)rate,
              kdcan_parity_letter(g_kd.parity));
 }
@@ -126,10 +148,21 @@ static void kdcan_flush_pending(void) {
 
 static void kdcan_stash_line_coding(uint32_t bit_rate, uint8_t parity,
                                     uint8_t data_bits) {
+    uint32_t rate = kdcan_effective_rate(bit_rate);
+
     g_kd.bit_rate = bit_rate;
     g_kd.parity = parity;
     g_kd.data_bits = data_bits;
     g_kd.coding_valid = true;
+
+    /* Host often reasserts the active settings; skip a no-op UART reconfig. */
+    if (g_kd.applied_valid && g_kd.applied_bit_rate == rate &&
+        g_kd.applied_parity == parity &&
+        g_kd.applied_data_bits == data_bits) {
+        g_kd.coding_dirty = false;
+        return;
+    }
+
     g_kd.coding_dirty = true;
 }
 
@@ -139,12 +172,14 @@ static void kdcan_line_coding_cb(int itf, uint32_t bit_rate, uint8_t stop_bits,
     if (itf != USB_CDC_INTERFACE_DATA) {
         return;
     }
+    /* Stash only: TinyUSB is not the link task, so vif_bus_param_set would
+     * return VIF_ERR_NO_CLAIM. feed/poll applies on the owner thread. */
     kdcan_stash_line_coding(bit_rate, parity, data_bits);
-    ESP_LOGI(TAG, "CDC line coding %lu 8%c1",
-             (unsigned long)(bit_rate ? bit_rate : 0),
-             kdcan_parity_letter(parity));
-    /* Try immediately; feed/poll retries if the bus is busy. */
-    kdcan_flush_coding();
+    if (g_kd.coding_dirty) {
+        ESP_LOGI(TAG, "CDC line coding %lu 8%c1",
+                 (unsigned long)kdcan_effective_rate(bit_rate),
+                 kdcan_parity_letter(parity));
+    }
 }
 
 static void kdcan_break_cb(int itf, uint16_t duration_ms) {
@@ -155,7 +190,7 @@ static void kdcan_break_cb(int itf, uint16_t duration_ms) {
     g_kd.break_assert = (duration_ms != 0);
     g_kd.break_dirty = true;
     ESP_LOGI(TAG, "CDC break duration=%u", (unsigned)duration_ms);
-    kdcan_flush_break();
+    /* Same as line coding: apply from feed/poll on the link task. */
 }
 
 static void kdcan_break_clear(void) {
@@ -199,6 +234,11 @@ static esp_err_t kdcan_bus_ensure(void) {
     vif_bus_param_set(VIF_OWNER_LINK, VIF_BUS_KLINE, BUS_P_K_LINE_ONLY, 1);
 
     g_kd.bus_open = true;
+    /* Defaults are live until CDC coding overrides them. */
+    g_kd.applied_valid = true;
+    g_kd.applied_bit_rate = KDCAN_DEFAULT_BAUD;
+    g_kd.applied_parity = 0; /* CDC none */
+    g_kd.applied_data_bits = 8;
     kdcan_flush_pending();
     return ESP_OK;
 }
