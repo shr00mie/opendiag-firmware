@@ -107,13 +107,9 @@ static void comm_ports_setup(void) {
 }
 
 /*
- * The one data link follows whichever transport has a client: a user talks to
- * this adapter over USB or over BLE, never both at once. That is what keeps
- * the grammar, the settings and the claims in one place.
- *
- * First connected wins. The loser is still connected as far as its transport
- * is concerned - refusing that is not vif's business - it simply does not get
- * the link until the first one lets go.
+ * The one data link follows USB data CDC while a host holds if00 open;
+ * otherwise a ready BLE client gets it. Never both. That keeps grammar,
+ * settings and claims in one place. Debug CDC never owns the link.
  *
  * The link starts on ELM327. The selected mode is sticky across disconnects;
  * only session state (parser, claims) is rebuilt when a client leaves.
@@ -123,47 +119,38 @@ static void link_led_refresh(void) {
     ws2812_led_set_link_solid(vif_link_port() == g_port_usb_cdc0);
 }
 
-static void link_try_bind(comm_port_id_t port) {
+/**
+ * @brief Bind the link to USB-when-active, else BLE-when-ready, else none.
+ *
+ * Preempts the other transport when policy says so (USB client attaching
+ * while BLE held; USB leaving while BLE is ready).
+ */
+static void link_apply_policy(void) {
+    comm_port_id_t want = COMM_INVALID_PORT_ID;
     comm_port_id_t held = vif_link_port();
 
-    if (held == port || held != COMM_INVALID_PORT_ID) {
-        return; /* already ours, or the other transport got here first */
+    if (port_usb_cdc0_is_connected()) {
+        want = g_port_usb_cdc0;
+    } else if (ble_uart_is_connected()) {
+        want = g_port_ble;
     }
 
-    vif_link_set_port(port);
+    if (held == want) {
+        link_led_refresh();
+        return;
+    }
+
+    if (held != COMM_INVALID_PORT_ID) {
+        vif_link_down();
+        vif_link_set_port(COMM_INVALID_PORT_ID);
+    }
+
+    if (want != COMM_INVALID_PORT_ID) {
+        vif_link_set_port(want);
+        ESP_LOGI(TAG, "link: %s",
+                 want == g_port_ble ? "ble" : "usb");
+    }
     link_led_refresh();
-}
-
-/**
- * @brief Offer the free link to a transport other than @p just_freed.
- *
- * That one was turned away while the link was held, and nothing else would
- * come along to ask it again.
- */
-static void link_offer_elsewhere(comm_port_id_t just_freed) {
-    if (just_freed != g_port_usb_cdc0 && port_usb_cdc0_is_connected()) {
-        link_try_bind(g_port_usb_cdc0);
-    } else if (just_freed != g_port_ble && ble_uart_is_connected()) {
-        link_try_bind(g_port_ble);
-    }
-}
-
-/** Take the link off @p port and pass it on. The client is treated as gone:
- *  its session state and claims must not reach whoever comes next; the
- *  selected mode stays put. */
-static void link_hand_back(comm_port_id_t port) {
-    vif_link_down();
-    vif_link_set_port(COMM_INVALID_PORT_ID);
-    link_offer_elsewhere(port);
-    link_led_refresh();
-}
-
-static void link_release(comm_port_id_t port) {
-    if (vif_link_port() != port) {
-        return; /* never held the link */
-    }
-
-    link_hand_back(port);
 }
 
 /* ------------------------------------------------------------------ *
@@ -227,7 +214,7 @@ void link_set(link_transport_t t) {
     }
 
     if (want != COMM_INVALID_PORT_ID) {
-        /* Named outright, so it wins over first-connected. */
+        /* Named outright — override automatic USB/BLE policy. */
         vif_link_set_port(want);
         ESP_LOGI(TAG, "link: %s by request", link_transport_name(t));
         link_led_refresh();
@@ -238,29 +225,22 @@ void link_set(link_transport_t t) {
      * cannot keep the data port "connected" after the user let go. */
     usb_cdc_session_latch_clear();
     ESP_LOGI(TAG, "link: let go by request");
-    link_offer_elsewhere(held);
-    link_led_refresh();
+    link_apply_policy();
 }
 
 /**
  * @brief A host opened or closed the USB data link.
  *
- * The falling edge hands the link back; it never reverts the grammar on
- * *connect*, which would be the obvious thing and the wrong one: the shell
- * sets the link's mode before the tool that needs it opens the port - slcand
- * cannot ask for SLCAN itself - so flipping back when that tool attaches
- * would make the whole feature unusable.
+ * Connect never reverts the sticky grammar: the shell may set the mode
+ * before the tool that needs it opens the port (slcand cannot ask for
+ * SLCAN itself).
  */
 static void usb_line_state_changed(int itf, bool connected) {
+    (void)connected;
     if (itf != USB_CDC_INTERFACE_DATA) {
         return;
     }
-
-    if (connected) {
-        link_try_bind(g_port_usb_cdc0);
-    } else {
-        link_release(g_port_usb_cdc0);
-    }
+    link_apply_policy();
 }
 
 /**
@@ -312,15 +292,12 @@ static void button_held_long(void) { ble_uart_forget_bonds(); }
 
 /**
  * "Ready" is the transport's call: encrypted in STRICT, any link in COMPAT.
- * A phone that is merely connected is not reported, so one that never
- * finishes pairing cannot hold the link against USB.
+ * A phone that is merely connected is not reported. USB data, when active,
+ * still outranks BLE.
  */
 static void ble_conn_changed(bool connected) {
-    if (connected) {
-        link_try_bind(g_port_ble);
-    } else {
-        link_release(g_port_ble);
-    }
+    (void)connected;
+    link_apply_policy();
 }
 
 /**
@@ -352,21 +329,15 @@ static void links_setup(void) {
     ws2812_led_set_mode_color(ws2812_led_color_for_mode("elm327"));
 
     /*
-     * The link binds to whichever transport connects first and is handed back
-     * when that one leaves. Both edges are reported by the transports
-     * themselves, so nothing has to poll.
+     * USB data CDC outranks BLE while a host holds if00; otherwise BLE when
+     * ready. Both edges are reported by the transports, so nothing polls.
      */
     usb_cdc_set_line_callback(usb_line_state_changed);
     ble_uart_set_conn_callback(ble_conn_changed);
 
     /* A host that opened the port before the callback existed reports no
-     * edge, so the state is read once here rather than waited for. */
-    if (port_usb_cdc0_is_connected()) {
-        link_try_bind(g_port_usb_cdc0);
-    } else if (ble_uart_is_connected()) {
-        link_try_bind(g_port_ble);
-    }
-    link_led_refresh();
+     * edge, so policy runs once here rather than waiting for an edge. */
+    link_apply_policy();
 
     /* Tap cycles modes; hold opens BLE pairing; long-hold forgets bonds. */
     button_set_click_callback(button_tapped);

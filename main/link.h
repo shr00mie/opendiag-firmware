@@ -6,13 +6,11 @@
  * @brief Which transport carries the one data link.
  *
  * A user talks to this adapter over USB or over BLE, never both, so there is
- * one session and it follows whichever transport has a client. First
- * connected wins.
+ * one session. USB data CDC (if00) holds the link while a host has that port
+ * open; otherwise a ready BLE client gets it. Debug CDC (if02) never owns the
+ * link.
  *
- * That rule needs an override, because a developer's host holds CDC0 open for
- * the whole session: the link binds to USB at boot and BLE can never take it,
- * so a phone connects, writes, and is met with silence. "link ble" hands it
- * over; "link drop" lets go so the next transport to connect can have it.
+ * Shell "link usb|ble|drop" remains an override for power users.
  */
 
 #include <stdbool.h>

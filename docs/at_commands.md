@@ -10,10 +10,14 @@ been lied to, which is worse than being told no.
 USB and Bluetooth), IgnMon / Low Power / Activity Monitor pins, and ScanDoc
 Ethernet extensions (DoIP protocol `D`, BMW HSFZ protocol `E`).
 
-### BMW CAN (ISO-TP extended addressing)
+### USER1/USER2 and extended CAN addressing
 
-Dealer-style BMW on CAN uses tester ID `0x6F1`, response CRA, and `AT CEA` /
-custom Flow Control — not HSFZ Ethernet. Recipe (QuantexLab):
+Protocols **B/C** (USER1/USER2), `AT PB`, `AT CEA`/`CER`, `AT CRA`, and custom
+Flow Control are stock ELM surfaces. Defaults match the datasheet (CEA off;
+factory USER baud/options). Clients that need custom CAN send those AT
+commands; nothing is gated behind a console mode.
+
+Example dealer-style ISO-TP recipe (QuantexLab; one of many clients):
 
 ```
 ATPB C101 / ATSPB / ATBI / ATSH6F1
@@ -114,12 +118,10 @@ Unsupported PP ids still answer `?`.
 `MA`, `MR hh` and `MT hh` are implemented for CAN. They run until any input
 byte is received, then print `STOPPED` and return the prompt.
 
-Automatic search (`AT SP 0`, or no `AT SP` at all) tries ISO 15765-4 CAN
-first, 500 kbaud 11 bit then 29 bit, then 250 kbaud. If the first CAN attempt
-hears no frame whatsoever - not a reply, not other traffic - the car most
-likely has no OBD CAN, so ISO 9141-2 (3) and ISO 14230-4 fast init (5) are
-tried before the remaining CAN protocols, which still follow, then J1850. `AT SS`
-selects the J1978 order instead, which already starts with J1850 and K-Line.
+Automatic search (`AT SP 0`, or no `AT SP` at all) tries all four ISO 15765-4
+CAN profiles first (500 kbaud 11/29 bit, then 250 kbaud 11/29 bit), then
+ISO 9141-2 and ISO 14230-4 fast init, then J1850. `AT SS` selects the J1978
+order instead, which starts with J1850 and K-Line.
 
 ### J1850 Specific Commands (protocols 1 and 2)
 

@@ -38,26 +38,29 @@ static const ble_profile_t g_profiles[BLE_PROFILE_COUNT] = {
             },
     },
     {
-        /* One characteristic does both jobs. */
+        /* Deep OBD: notify FFE1, write FFE2. Carly uses FFE1 for both;
+         * FFE1 keeps write+notify so that layout still matches. */
         .id = BLE_PROFILE_FFE0,
         .name = "ffe0",
         .service = UUID16(0xFFE0),
-        .num_chrs = 1,
+        .num_chrs = 2,
         .chrs =
             {
                 {UUID16(0xFFE1), BLE_CHR_DATA_RXTX,
                  RX_PROPS | BLE_CHR_PROP_NOTIFY},
+                {UUID16(0xFFE2), BLE_CHR_DATA_RX, RX_PROPS},
             },
     },
     {
+        /* WgSoft / common FFF0 clones: notify FFF1, write FFF2. */
         .id = BLE_PROFILE_FFF0,
         .name = "fff0",
         .service = UUID16(0xFFF0),
         .num_chrs = 2,
         .chrs =
             {
-                {UUID16(0xFFF1), BLE_CHR_DATA_RX, RX_PROPS},
-                {UUID16(0xFFF2), BLE_CHR_DATA_TX, BLE_CHR_PROP_NOTIFY},
+                {UUID16(0xFFF1), BLE_CHR_DATA_TX, BLE_CHR_PROP_NOTIFY},
+                {UUID16(0xFFF2), BLE_CHR_DATA_RX, RX_PROPS},
             },
     },
     {

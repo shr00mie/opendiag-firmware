@@ -94,12 +94,11 @@ Both can be connected at the same time. When they are, the adapter runs from the
 ## One data link, two ways to reach it
 
 OpenDIAG has **one** data link, and it runs over either USB or Bluetooth. It doesn't use both at
-once. **The first one to connect gets it.** The other one can connect, but it gets no answer until
-the first one disconnects.
+once. **While a host holds the USB data port (if00) open, USB owns the link.** Otherwise a ready
+Bluetooth LE client gets it. The debug port (if02) never takes the data link.
 
-A computer that keeps the USB data port open therefore locks out a phone. To hand the link to the
-phone without closing the port, type `link ble` in the [debug shell](#the-debug-shell). To let
-whichever connects next take it, type `link drop`.
+Close the USB data port (or type `link drop` in the [debug shell](#the-debug-shell)) to let a phone
+use BLE. `link usb` / `link ble` remain overrides for power users.
 
 Whenever the client holding the link disconnects, the adapter clears that client's session: settings
 are reset and every bus and pin it opened is released. The **selected mode stays put** (it does not
@@ -225,16 +224,16 @@ whether one is connected. `ble pair` opens the pairing window from the shell.
 
 ### For app developers: GATT layout
 
-The adapter exposes several BLE serial profiles that all carry the same ELM327 byte stream, so apps
-that look for Vgate-, Veepeak-, or Nordic-style UUIDs can find a write/notify pair. Control lives in
-a separate OpenDIAG service (not on Nordic UART).
+The adapter exposes several BLE serial profiles for discovery compatibility. Apps pick one
+write/notify pair; replies follow the profile that last received a data write (not every CCCD
+subscribe during discovery). Control lives in a separate OpenDIAG service.
 
 | Profile | Service | Write | Notify |
 | --- | --- | --- | --- |
 | Nordic UART | `6E400001-…` | `6E400002-…` | `6E400003-…` |
-| Vgate-style | `FFE0` | `FFE1` | `FFE1` |
-| Veepeak-style | `FFF0` | `FFF1` | `FFF2` |
-| OBDLink-style | `18F0` | `2AF1` | `2AF0` |
+| FFE0 (Deep OBD / Carly) | `FFE0` | `FFE2` (also `FFE1`) | `FFE1` |
+| FFF0 (WgSoft-style) | `FFF0` | `FFF2` | `FFF1` |
+| 18F0 | `18F0` | `2AF1` | `2AF0` |
 | OpenDIAG control | `7D1A6C01-6F70-656E-6469-61672D637472` | `…6C02…` | `…6C02…` |
 
 In the default **strict** security mode, data and control need an encrypted, bonded connection. The
@@ -272,11 +271,12 @@ Apps that only support *Bluetooth Classic* ELM327 adapters won't find it. Look f
 | 7 | ISO 15765-4 CAN 29-bit, 500 kbaud | ✅ |
 | 8 | ISO 15765-4 CAN 11-bit, 250 kbaud | ✅ |
 | 9 | ISO 15765-4 CAN 29-bit, 250 kbaud | ✅ |
-| A–C | J1939, USER1, USER2 | not yet |
+| A | SAE J1939 CAN | partial (selection only) |
+| B–C | USER1 / USER2 custom CAN | ✅ |
 
-Automatic search tries CAN first (500k before 250k), then K-Line, then J1850. Setting a protocol
-by hand skips the search and connects faster. `AT SS` switches to the SAE J1978 order, which
-starts with J1850.
+Automatic search tries all four ISO 15765-4 CAN profiles first, then K-Line, then J1850. Setting a
+protocol by hand skips the search and connects faster. `AT SS` switches to the SAE J1978 order,
+which starts with J1850.
 
 The full list of supported AT commands is in [at_commands.md](at_commands.md).
 
@@ -565,7 +565,7 @@ Updating keeps your paired phones and the unit's voltage calibration.
 | --- | --- |
 | Phone can't find **OpenDIAG** | A new or reset unit doesn't advertise until you open the pairing window. Hold the button for 2 s (LED blinks blue), then connect within 60 s. |
 | Phone used to connect, now can't | The phone and adapter no longer share a key. Remove the adapter from the phone's Bluetooth settings, hold the button for 10 s, and pair again. |
-| Phone connects but gets no answer | USB holds the data link. Close the program using the data port, or type `link ble` in the shell. |
+| Phone connects but gets no answer | A host still has the USB data port open. Close that program (or `link drop` / `link ble` in the shell). |
 | App connects but says "unable to connect to ECU" / `NO DATA` | Is the ignition on? Try setting the protocol by hand with `AT SP`. |
 | App reports `?` after selecting a protocol | The bus is held by the debug shell. Run `ctrl BUS` or `vif` in the shell to check. |
 | **Save & Test** fails in `opendiag_config.exe` | Check you picked the **data** COM port, not the debug port, and that no other program has it open. |

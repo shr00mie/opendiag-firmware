@@ -59,9 +59,9 @@ typedef struct {
 
 typedef enum {
     BLE_PROFILE_NUS,  /**< Nordic UART Service. The original, and the default. */
-    BLE_PROFILE_FFE0, /**< FFE0 / FFE1: Vgate and most HM-10 style dongles. */
-    BLE_PROFILE_FFF0, /**< FFF0 / FFF1 / FFF2: Veepeak. */
-    BLE_PROFILE_18F0, /**< 18F0 / 2AF1 / 2AF0. */
+    BLE_PROFILE_FFE0, /**< FFE0: Deep OBD (FFE1 notify / FFE2 write) + Carly. */
+    BLE_PROFILE_FFF0, /**< FFF0: WgSoft-style (FFF1 notify / FFF2 write). */
+    BLE_PROFILE_18F0, /**< 18F0 / 2AF1 write / 2AF0 notify. */
     BLE_PROFILE_COUNT,
 } ble_profile_id_t;
 

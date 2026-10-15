@@ -22,8 +22,8 @@ In this tree:
 
 ## Features
 
-*   **ELM327 Compatible:** AT command set over USB and BLE for drop-in use with existing ELM327 OBD-II apps. Protocols 1–9 plus USER1/USER2 custom CAN (`AT PB`, `AT CEA`, Flow Control, etc.). Session-backed `AT PP`/`PPS` and CAN monitors `AT MA`/`MR`/`MT`.
-*   **Multi-profile BLE:** Nordic UART plus Vgate / Veepeak / OBDLink-style GATT layouts so more phone apps find a write/notify pair. Separate OpenDIAG control service; `ble compat` and `ble name` for bring-up.
+*   **ELM327 Compatible:** AT command set over USB and BLE for drop-in use with existing ELM327 OBD-II apps. Protocols 1–9 / A plus USER1/USER2 custom CAN (`AT PB`, `AT CEA`, Flow Control, etc.). Session-backed `AT PP`/`PPS` and CAN monitors `AT MA`/`MR`/`MT`.
+*   **Multi-profile BLE:** Nordic UART plus FFE0 / FFF0 / 18F0 compatibility layouts so more phone apps find a write/notify pair. Separate OpenDIAG control service; `ble compat` and `ble name` for bring-up. USB data port outranks BLE while open.
 *   **Multiple link modes:** ELM327, SLCAN, J2534, Ediabas / Deep OBD (DS2), and K+DCAN UART. Switch with a short button tap, the debug-shell `mode` command, `AT VIF …`, or BLE `MODE=`. The selected mode stays sticky across disconnects (clears session state, does not force ELM327).
 *   **OBD-II physical layers:** CAN (ISO 15765-4), K-Line and L-Line (ISO 9141-2, ISO 14230-4 KWP), SAE J1850 PWM and VPW. K-Line supports higher baud (including `AT IB115`) plus DS2 and raw framing used by Ediabas / K+DCAN.
 *   **SLCAN (LAWICEL):** Raw CAN for `slcand`, SavvyCAN, python-can, and similar tools, without the ELM327 layer.
@@ -73,7 +73,7 @@ ports, and advertises over BLE as **OpenDIAG** (or **OBDII** if you set `ble nam
 | --- | --- |
 | USB CDC 0 | data link — ELM327 by default; also SLCAN, J2534, Ediabas, K+DCAN |
 | USB CDC 1 | console and debug shell |
-| BLE data characteristics | same data link over multi-profile GATT (Nordic / Vgate / Veepeak / OBDLink-style) |
+| BLE data characteristics | same data link over multi-profile GATT (Nordic / FFE0 / FFF0 / 18F0) |
 | BLE control characteristic | control commands (`MODE=`, etc.) on the OpenDIAG control service |
 
 The link starts in **ELM327**. When a client disconnects, session state is cleared but the

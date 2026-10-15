@@ -1178,7 +1178,40 @@ TEST(failed_flow_control_keeps_can_open_for_the_next_request) {
     TEST_ASSERT_EQUAL_HEX32(CAN_EFF_FLAG | 0x0CDA10F1, fake_can_sent(1)->id);
 }
 
-/* ---- USER1 / BMW extended addressing (Phases 1–2) ---- */
+/* ---- USER1 / USER2 custom CAN (stock defaults + ISO-TP) ---- */
+
+TEST(user1_factory_defaults_open_can_at_125k) {
+    elm_echo_off();
+    /* PP 2C/2D factory E0/04: format none, 125 kbaud — no AT PB required. */
+    elm_ok("ATSPB\r");
+    TEST_ASSERT_EQUAL_INT(125000, fake_can_last_baud());
+    TEST_ASSERT_TRUE(fake_can_is_up());
+    TEST_ASSERT_EQUAL_STRING("B\r" ELM_PROMPT, elm_ask("ATDPN\r"));
+}
+
+TEST(user1_format_none_accepts_non_obd_reply_ids_without_cra) {
+    elm_echo_off();
+    elm_ok("ATSPB\r");
+    elm_ok("ATBI\r");
+    elm_ok("ATH1\r");
+    elm_ok("ATCAF0\r");
+    elm_ok("ATSH123\r");
+
+    static const uint8_t reply[8] = {0x11, 0x22, 0x33, 0x44,
+                                     0x55, 0x66, 0x77, 0x88};
+    /* Not in 7E8–7EF — format none must still accept without CRA. */
+    fake_can_stage_response(0x456, 8, reply, 1);
+
+    const char *out = elm_ask("010203\r");
+    TEST_ASSERT_NOT_NULL(strstr(out, "456"));
+}
+
+TEST(user1_j1939_format_is_refused) {
+    elm_echo_off();
+    elm_ok("ATPBE202\r"); /* opts E2: bits 2..0 = J1939 format */
+    TEST_ASSERT_EQUAL_STRING("?\r" ELM_PROMPT, elm_ask("ATSPB\r"));
+    TEST_ASSERT_FALSE(fake_can_is_up());
+}
 
 TEST(user1_pb_opens_can_at_500k) {
     elm_echo_off();

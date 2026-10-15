@@ -63,21 +63,29 @@ TEST(nus_uses_the_nordic_uuids) {
     TEST_ASSERT_FALSE(p->chrs[1].props & BLE_CHR_PROP_WRITE);
 }
 
-TEST(ffe0_has_one_characteristic_for_both_directions) {
+TEST(ffe0_has_ffe1_rxtx_and_ffe2_write) {
     const ble_profile_t *p = ble_profile_get(BLE_PROFILE_FFE0);
+    const ble_profile_chr_t *ffe2;
 
     TEST_ASSERT_NOT_NULL(p);
     TEST_ASSERT_EQUAL_INT(0xFFE0, ble_profile_uuid16(&p->service));
-    TEST_ASSERT_EQUAL_INT(1, p->num_chrs);
+    TEST_ASSERT_EQUAL_INT(2, p->num_chrs);
     TEST_ASSERT_EQUAL_INT(0xFFE1, ble_profile_uuid16(&p->chrs[0].uuid));
     TEST_ASSERT_EQUAL_INT(BLE_CHR_DATA_RXTX, p->chrs[0].role);
     TEST_ASSERT(ble_chr_is_rx(&p->chrs[0]));
     TEST_ASSERT(ble_chr_is_tx(&p->chrs[0]));
     TEST_ASSERT(p->chrs[0].props & BLE_CHR_PROP_WRITE);
     TEST_ASSERT(p->chrs[0].props & BLE_CHR_PROP_NOTIFY);
+
+    ffe2 = &p->chrs[1];
+    TEST_ASSERT_EQUAL_INT(0xFFE2, ble_profile_uuid16(&ffe2->uuid));
+    TEST_ASSERT_EQUAL_INT(BLE_CHR_DATA_RX, ffe2->role);
+    TEST_ASSERT(ble_chr_is_rx(ffe2));
+    TEST_ASSERT_FALSE(ble_chr_is_tx(ffe2));
+    TEST_ASSERT(ffe2->props & BLE_CHR_PROP_WRITE);
 }
 
-TEST(fff0_writes_on_fff1_and_notifies_on_fff2) {
+TEST(fff0_notifies_on_fff1_and_writes_on_fff2) {
     const ble_profile_t *p = ble_profile_get(BLE_PROFILE_FFF0);
     const ble_profile_chr_t *rx;
     const ble_profile_chr_t *tx;
@@ -89,8 +97,9 @@ TEST(fff0_writes_on_fff1_and_notifies_on_fff2) {
     tx = find_role(p, BLE_CHR_DATA_TX);
     TEST_ASSERT_NOT_NULL(rx);
     TEST_ASSERT_NOT_NULL(tx);
-    TEST_ASSERT_EQUAL_INT(0xFFF1, ble_profile_uuid16(&rx->uuid));
-    TEST_ASSERT_EQUAL_INT(0xFFF2, ble_profile_uuid16(&tx->uuid));
+    /* WgSoft polarity: notify FFF1, write FFF2. */
+    TEST_ASSERT_EQUAL_INT(0xFFF2, ble_profile_uuid16(&rx->uuid));
+    TEST_ASSERT_EQUAL_INT(0xFFF1, ble_profile_uuid16(&tx->uuid));
     TEST_ASSERT(rx->props & BLE_CHR_PROP_WRITE);
     TEST_ASSERT(tx->props & BLE_CHR_PROP_NOTIFY);
 }

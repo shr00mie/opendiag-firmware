@@ -73,9 +73,9 @@ static struct ble_gatt_svc_def g_svc_defs[BLE_PROFILE_COUNT + 2];
 static uint16_t conn_handle;
 
 /*
- * Which data profile the client is using, so replies go out on the
- * characteristic it subscribed to or last wrote to. Starts on NUS, which is
- * where the adapter always answered before the other layouts existed.
+ * Which data profile receives notifies: last characteristic the client
+ * wrote ELM data to. CCCD subscribe alone does not change this (apps often
+ * enable notify on every TX during discovery). Starts on NUS until a write.
  */
 static volatile uint8_t g_active_profile = BLE_PROFILE_NUS;
 
@@ -1042,15 +1042,10 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
         print_conn_desc(&desc);
         return rc;
 
-    /* A client turned notifications on or off: that is the door it chose. */
+    /* CCCD alone must not steal the active profile — apps often enable
+     * notify on every data TX during discovery. Routing follows the last
+     * data write (see access_cb). */
     case BLE_GAP_EVENT_SUBSCRIBE:
-        for (int i = 0; i < g_slot_count; i++) {
-            if (g_slots[i].handle == event->subscribe.attr_handle &&
-                g_slots[i].profile != BLE_SLOT_CTRL &&
-                ble_chr_is_tx(g_slots[i].def) && event->subscribe.cur_notify) {
-                g_active_profile = g_slots[i].profile;
-            }
-        }
         return 0;
 
     case BLE_GAP_EVENT_ADV_COMPLETE:

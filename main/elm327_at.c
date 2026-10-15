@@ -14,6 +14,7 @@
 #include "ble_uart.h"
 #include "can_xfer.h"
 #include "common.h"
+#include "elm327_user_can.h"
 #include "isotp.h"
 #include "j1850_pwm.h"
 #include "j1850_vpw.h"
@@ -323,9 +324,7 @@ typedef struct {
      *
      * A controller acknowledges every valid frame it hears, so traffic of any
      * kind - not only a reply to our request - proves a live CAN bus at the
-     * bit rate in use. The automatic search reads silence on the first CAN
-     * attempt as "no OBD CAN here" and tries K-Line before the other three
-     * CAN protocols, which is what a pre-CAN car such as an E46 needs.
+     * bit rate in use.
      */
     bool can_rx_seen;
     uint8_t last_obd_buf[12];
@@ -815,23 +814,18 @@ static vif_bus_t elm327_bus_for_protocol(int proto, vif_bus_cfg_t *cfg,
         break;
     case ELM327_PROTO_CAN_USER1:
     case ELM327_PROTO_CAN_USER2: {
-        /* Options/divisor from AT PB (B) or defaults (C). Format must be
-         * ISO 15765-4 (bits 2..0 == 001); J1939/none stay unimplemented. */
+        /* AT PB / PP 2C–2F: format none and ISO-TP open CAN; J1939 does not. */
         const elm327_settings_t *s = &g_elm327.settings;
         uint8_t opts =
             proto == ELM327_PROTO_CAN_USER1 ? s->proto_b_opts : s->proto_c_opts;
         uint8_t div =
             proto == ELM327_PROTO_CAN_USER1 ? s->proto_b_div : s->proto_c_div;
-        if ((opts & 0x07u) != 0x01u || div < 0x01u || div > 0x40u) {
+        if (!elm327_user_can_openable(opts, div)) {
             break;
         }
         bus = VIF_BUS_CAN;
-        bitrate = 500000u / div;
-        if (opts & 0x80u) {
-            header_id = 0x7DF;
-        } else {
-            header_id = 0x18DB33F1;
-        }
+        bitrate = elm327_user_bitrate(div);
+        header_id = elm327_user_default_header(opts);
         break;
     }
     default:
@@ -908,6 +902,12 @@ static int elm327_set_protocol(elm327_ctx_t *e, int proto) {
              * A client that wants the bus released has AT PC, which is what
              * "Protocol Close" is for. */
             e->search_first = e->settings.current_protocol;
+        } else if (proto == ELM327_PROTO_CAN_USER1 ||
+                   proto == ELM327_PROTO_CAN_USER2) {
+            /* USER1/USER2 with unsupported PP format (e.g. J1939) must not
+             * answer OK with no bus — clients would believe the protocol is
+             * live. */
+            return -1;
         } else {
             if (vif_bus_release_all(VIF_OWNER_LINK) != ESP_OK)
                 return -1;
@@ -933,6 +933,14 @@ static int elm327_set_protocol(elm327_ctx_t *e, int proto) {
 
     if (vif_bus_release_all(VIF_OWNER_LINK) != ESP_OK)
         return -1;
+
+    if (proto == ELM327_PROTO_CAN_USER1) {
+        e->settings.can_var_dlc =
+            elm327_user_opts_var_dlc(e->settings.proto_b_opts);
+    } else if (proto == ELM327_PROTO_CAN_USER2) {
+        e->settings.can_var_dlc =
+            elm327_user_opts_var_dlc(e->settings.proto_c_opts);
+    }
 
     if (vif_bus_open(VIF_OWNER_LINK, bus, &cfg) != ESP_OK) {
         /* Startup failed; VIF may retain a claim until cleanup succeeds. */
@@ -1880,7 +1888,7 @@ static void elm327_at_command_handler(elm327_ctx_t *e, const char *cmd) {
                  e->settings.key_word_check ? "on" : "off");
         elm327_send_string(e, "OK\r");
     } else if (strncmp(cmd, "IB", 2) == 0) {
-        /* Datasheet rates, plus 115200 for BMW-FAST-class K-Line. Rates above
+        /* Datasheet rates, plus 115200 for OEM fast K-Line. Rates above
          * 10400 are past what ISO 14230-2 allows and exist for manufacturer
          * specific systems that use them anyway. */
         uint32_t baud = 0;
@@ -1969,8 +1977,8 @@ static void elm327_at_command_handler(elm327_ctx_t *e, const char *cmd) {
     } else if (strcmp(cmd, "BI") == 0) {
         /* "allows an OBD protocol to be made active without requiring any
          * sort of initiation or handshaking to occur." Nothing goes on the
-         * wire; only our idea of the link changes. Required for BMW CAN
-         * (USER1 + CEA) which has no OBD init handshake. */
+         * wire; only our idea of the link changes. Used for USER1/USER2 CAN
+         * and other paths that have no OBD init handshake. */
         if (elm327_is_kline(e)) {
             kline_variant_t v =
                 elm327_is_kwp(e) ? KLINE_VARIANT_KWP : KLINE_VARIANT_ISO9141;
@@ -2451,9 +2459,23 @@ static bool elm327_can_reply_id_ok(const elm327_ctx_t *e, uint32_t id) {
                ((id ^ want) & mask & CAN_EFF_MASK) == 0;
     }
 
-    /* USER1/USER2 have no legislated OBD reply range without CRA. */
     if (elm327_can_is_user(e)) {
-        return false;
+        uint8_t opts = e->settings.current_protocol == ELM327_PROTO_CAN_USER1
+                           ? e->settings.proto_b_opts
+                           : e->settings.proto_c_opts;
+        elm327_user_fmt_t fmt = elm327_user_fmt(opts);
+
+        /* Format none: raw monitor / non-OBD — accept matching ID width. */
+        if (fmt == ELM327_USER_FMT_NONE) {
+            if (elm327_can_is_11bit(e)) {
+                return !extended;
+            }
+            return extended;
+        }
+        /* ISO-TP USER without CRA: same legislated OBD ranges as 6–9. */
+        if (fmt != ELM327_USER_FMT_ISOTP) {
+            return false;
+        }
     }
 
     if (elm327_can_is_11bit(e)) {
@@ -3575,18 +3597,10 @@ static int elm327_search_attempt(elm327_ctx_t *e, uint8_t proto, uint8_t *prev,
     return elm327_try_protocol(e, proto, frame, len, num_frame);
 }
 
-/** @brief True for the four ISO 15765-4 protocols a search tries. */
-static bool elm327_is_obd_can(uint8_t proto) {
-    return proto >= ELM327_PROTO_CAN_11BIT_500K &&
-           proto <= ELM327_PROTO_CAN_29BIT_250K;
-}
-
 /** @brief What a search remembers between attempts. */
 typedef struct {
-    uint8_t prev;      /**< Protocol of the previous attempt. */
-    uint16_t tried;    /**< Bit n set: protocol n has been attempted. */
-    bool can_traffic;  /**< Some CAN attempt heard any frame at all. */
-    bool kline_detour; /**< The early K-Line pass has been made (or is moot). */
+    uint8_t prev;   /**< Protocol of the previous attempt. */
+    uint16_t tried; /**< Bit n set: protocol n has been attempted. */
 } elm327_search_state_t;
 
 static int elm327_search_step(elm327_ctx_t *e, elm327_search_state_t *s,
@@ -3594,53 +3608,7 @@ static int elm327_search_step(elm327_ctx_t *e, elm327_search_state_t *s,
                               int num_frame) {
     s->tried |= (uint16_t)(1u << proto);
     e->can_rx_seen = false;
-    int ret = elm327_search_attempt(e, proto, &s->prev, frame, len, num_frame);
-    if (elm327_is_obd_can(proto) && e->can_rx_seen) {
-        s->can_traffic = true;
-    }
-    return ret;
-}
-
-/**
- * @brief Try K-Line now if the CAN attempt that just failed heard nothing.
- *
- * Not one frame on the wire - not even somebody else's - means there is no
- * CAN bus here at this bit rate, and the usual reason is a car that has none:
- * an E46 or any other pre-2008 K-Line vehicle. Walking the other three CAN
- * protocols first is three more bring-ups, each ending in a bus-off recovery
- * because nothing acknowledges the frame, and only then reaching the protocol
- * that would have answered. So the K-Line protocols go next, and the rest of
- * CAN follows them rather than being dropped: a 250 kbaud or 29 bit bus
- * looks exactly this silent to a controller set to 500 kbaud.
- *
- * Done at most once per search, and not at all in the J1978 order, which
- * already has K-Line ahead of CAN.
- *
- * @return >= 0 if a K-Line protocol answered, otherwise < 0.
- */
-static int elm327_search_kline_detour(elm327_ctx_t *e,
-                                      elm327_search_state_t *s,
-                                      uint8_t failed, const uint8_t *frame,
-                                      size_t len, int num_frame) {
-    static const uint8_t kline[] = {ELM327_PROTO_ISO9141,
-                                    ELM327_PROTO_ISO14230_KWP_FAST};
-    int ret = -1;
-
-    if (s->kline_detour || !elm327_is_obd_can(failed) || s->can_traffic) {
-        return ret;
-    }
-
-    s->kline_detour = true;
-    for (size_t i = 0; i < sizeof(kline); i++) {
-        if (s->tried & (1u << kline[i])) {
-            continue;
-        }
-        ret = elm327_search_step(e, s, kline[i], frame, len, num_frame);
-        if (ret >= 0) {
-            break;
-        }
-    }
-    return ret;
+    return elm327_search_attempt(e, proto, &s->prev, frame, len, num_frame);
 }
 
 /**
@@ -3648,20 +3616,14 @@ static int elm327_search_kline_detour(elm327_ctx_t *e,
  *
  * "SAE standard J1978 specifies a protocol search order that scan tools
  * should use... In order to provide a faster search, the ELM327 does not
- * normally follow this order." Neither does this: CAN is first because it is
- * what a vehicle built this century answers to, and the 5 baud handshake is
- * left as late as possible because it alone costs two and a half seconds
- * whether it works or not.
+ * normally follow this order." Neither does this: CAN is first (all four
+ * ISO 15765-4 combinations) because bring-up is cheap, and the 5 baud
+ * handshake is left later because it alone costs about two and a half
+ * seconds whether it works or not. AT SS selects the J1978 order instead.
  *
- * The exception is a CAN attempt that hears nothing at all: that is a car
- * without OBD CAN, so K-Line (3, then 5) is tried before the remaining CAN
- * protocols. See elm327_search_kline_detour().
- *
- * Ahead of all of them comes whatever AT SP 0 was holding when it was asked
- * to go automatic. A client that has just been talking to the vehicle and
- * then resets the search - which is the common shape, and what AT SP 0 is
- * documented as being used for - gets that protocol confirmed in one attempt
- * rather than rediscovered from the far end of the list.
+ * Ahead of the list comes whatever AT SP 0 was holding when it was asked
+ * to go automatic, so a client that resets the search from a working
+ * protocol confirms it in one attempt.
  *
  * ISO 14230-4 with a 5 baud init is deliberately absent: it is the same
  * handshake as ISO 9141-2 and differs only in the key bytes that come back,
@@ -3717,7 +3679,6 @@ static int elm327_search_protocol_xfer(elm327_ctx_t *e, const uint8_t *frame,
     elm327_search_state_t state = {
         .prev = skip,
         .tried = (uint16_t)(1u << skip),
-        .kline_detour = e->settings.std_search_order,
     };
     int ret = -1;
 
@@ -3725,10 +3686,6 @@ static int elm327_search_protocol_xfer(elm327_ctx_t *e, const uint8_t *frame,
 
     if (first != ELM327_PROTO_AUTO) {
         ret = elm327_search_step(e, &state, first, frame, len, num_frame);
-        if (ret < 0) {
-            ret = elm327_search_kline_detour(e, &state, first, frame, len,
-                                             num_frame);
-        }
         if (ret >= 0) {
             ret = 0;
             goto done;
@@ -3741,10 +3698,6 @@ static int elm327_search_protocol_xfer(elm327_ctx_t *e, const uint8_t *frame,
         }
 
         ret = elm327_search_step(e, &state, order[i], frame, len, num_frame);
-        if (ret < 0) {
-            ret = elm327_search_kline_detour(e, &state, order[i], frame, len,
-                                             num_frame);
-        }
         if (ret >= 0) {
             ret = 0;
             goto done;
