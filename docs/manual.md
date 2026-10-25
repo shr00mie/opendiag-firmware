@@ -466,6 +466,12 @@ Open the **DEBUG** USB serial port in any terminal program, such as PuTTY, scree
 minicom, `idf.py monitor`, or `python tools/serial_term.py`, which adds highlighting. Type `help`
 for the list of commands.
 
+While an app holds the data link, the same console prints live traffic from every
+front-end using shared prefixes: `app >` / `app <` (host link) and `bus tx` /
+`bus rx` (vehicle bus). ELM327 logs hex OBD requests as well as AT commands;
+timeouts include the request string. See the README “Debug console traffic log”
+section for the full table.
+
 ### Everyday commands
 
 | Command | Description |

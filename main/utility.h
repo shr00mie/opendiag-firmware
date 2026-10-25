@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 #pragma once
 
+#include <stddef.h>
+#include <stdint.h>
+
 /**
  * @brief Dumps a block of memory to stdout in a standard hexdump format.
  *
@@ -11,6 +14,23 @@
  * @param size The total number of bytes to dump.
  */
 void hexdump(const void *data, size_t size);
+
+/**
+ * @brief One-line ESP_LOGI of raw bytes for debug-console traffic tracing.
+ *
+ * Prefer the prefixes @c "app >" / @c "app <" (host link) and
+ * @c "bus tx" / @c "bus rx" (vehicle bus) so every front-end reads the same.
+ * Long payloads are truncated with a trailing byte count.
+ */
+void log_io_hex(const char *tag, const char *prefix, const uint8_t *data,
+                size_t len);
+
+/** @brief One-line ESP_LOGI of a text command/response (e.g. SLCAN / ELM). */
+void log_io_text(const char *tag, const char *prefix, const char *text);
+
+/** @brief One-line ESP_LOGI of a classic CAN frame on the vehicle bus. */
+void log_io_can(const char *tag, const char *prefix, uint32_t id, uint8_t dlc,
+                const uint8_t *data);
 
 /**
  * @brief Converts a hex string into a byte array.

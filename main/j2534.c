@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "esp_app_desc.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "board.h"
 #include "isotp.h"
@@ -12,6 +13,9 @@
 #include "kline_codec.h"
 #include "pb_decode.h"
 #include "pb_encode.h"
+#include "utility.h"
+
+#define TAG "J2534"
 
 #define CHANNELS (J2534_PHYSICAL_MAX + J2534_LOGICAL_MAX)
 #define RX_BYTES 8192u
@@ -252,6 +256,10 @@ static void enqueue_rx(channel_t *channel, uint32_t handle, uint32_t status,
         channel->overflow = true;
         return;
     }
+    /* Host-visible RX (PassThruReadMsgs). Skip empty indications. */
+    if (len && data) {
+        log_io_hex(TAG, "app <", data, len);
+    }
     uint8_t header[MSG_HEADER];
 
     j2534_put32(header, channel->protocol);
@@ -416,9 +424,11 @@ static void tx_done(channel_t *channel, bool ok) {
 static int send_byte_message(channel_t *channel) {
     bus_msg_t msg;
     const uint8_t *data = channel->tx + MSG_HEADER;
+    size_t len = channel->tx_len - MSG_HEADER;
     uint32_t flags = j2534_u32(channel->tx + 12);
 
-    bus_msg_tx(&msg, data, channel->tx_len - MSG_HEADER, 0);
+    log_io_hex(TAG, "bus tx", data, len);
+    bus_msg_tx(&msg, data, len, 0);
     return vif_bus_send(VIF_OWNER_LINK, channel->bus, &msg,
                         flags & J2534_WAIT_P3 ? BUS_TX_WAIT_P3_MIN_ONLY : 0);
 }
@@ -515,6 +525,9 @@ static void submit_bus_tx(channel_t *channel, tx_kind_t kind, uint32_t job,
         physical->pending.frame.dlc = msg->len;
         memcpy(physical->pending.frame.data, msg->data, msg->len);
         bus_flags |= BUS_TX_WAIT_DONE;
+        log_io_can(TAG, "bus tx", msg->id, (uint8_t)msg->len, msg->data);
+    } else {
+        log_io_hex(TAG, "bus tx", msg->data, msg->len);
     }
     int rc = vif_bus_submit(VIF_OWNER_LINK, physical->bus, msg, bus_flags,
                             physical->rx_sequence);
@@ -741,6 +754,7 @@ static void poll_rx(channel_t *channel) {
             struct can_frame frame = {.id = msg.id, .dlc = len};
 
             memcpy(frame.data, data, len);
+            log_io_can(TAG, "bus rx", frame.id, frame.dlc, frame.data);
             for (unsigned i = J2534_PHYSICAL_MAX; i < CHANNELS; i++)
                 if (channels[i].parent == channel->id)
                     logical_receive(&channels[i], &frame, msg.timestamp_us);
@@ -756,6 +770,7 @@ static void poll_rx(channel_t *channel) {
             }
             if (!len)
                 continue;
+            log_io_hex(TAG, "bus rx", data, len);
         }
         if (msg.status & BUS_RX_TX_MSG_TYPE)
             flags |= J2534_TX_MSG;

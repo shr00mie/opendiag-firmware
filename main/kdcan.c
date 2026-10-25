@@ -12,6 +12,7 @@
 
 #include "bus.h"
 #include "usb_cdc.h"
+#include "utility.h"
 #include "vif.h"
 
 #define TAG "KDCAN"
@@ -320,6 +321,8 @@ static void kdcan_fe_feed(const uint8_t *data, size_t len) {
     /* Baud/parity/break must match the host before this telegram hits the wire. */
     kdcan_flush_pending();
 
+    log_io_hex(TAG, "app >", data, len);
+    log_io_hex(TAG, "bus tx", data, len);
     bus_msg_tx(&msg, data, len, 0);
     rc = vif_bus_send(VIF_OWNER_LINK, VIF_BUS_KLINE, &msg, BUS_TX_NO_CHECKSUM);
     if (rc != 0) {
@@ -351,6 +354,8 @@ static void kdcan_fe_poll(void) {
             break;
         }
         if (msg.len) {
+            log_io_hex(TAG, "bus rx", msg.data, msg.len);
+            log_io_hex(TAG, "app <", msg.data, msg.len);
             vif_link_write(msg.data, msg.len);
             wrote = true;
         }

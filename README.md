@@ -30,6 +30,7 @@ In this tree:
 *   **J2534 pass-thru:** Windows driver path for diagnostic / reprogramming software (see the user manual).
 *   **Pin control:** Programmable high-side and low-side drivers on the OBD connector, with a software-adjustable boost for manufacturer wake-up and programming voltages.
 *   **Status LED:** Mode colour (cyan / green / magenta / white / blue) with solid vs breathing for USB vs BLE (or no holder); overlays for pairing and live pins.
+*   **Debug-console IO tracing:** Every link mode logs host and vehicle traffic on the debug CDC (`if02`) with a shared vocabulary (`app >` / `app <` / `bus tx` / `bus rx`), so live PID polling and raw frames are visible while an app is connected over USB or BLE.
 
 ## Building
 
@@ -54,7 +55,26 @@ idf.py -p /dev/ttyACM0 flash
 idf.py -p /dev/ttyACM1 monitor   # the console is the SECOND port
 ```
 
-The first port carries protocol traffic, not the console.
+The first port carries protocol traffic, not the console. Prefer
+`python tools/serial_term.py` on the debug port when hunting app/bus issues —
+it highlights the IO trace lines below.
+
+### Debug console traffic log
+
+While a phone or PC holds the **data** link (USB CDC 0 or BLE), open **CDC 1**
+and watch ESP_LOGI lines from the active front-end. All modes share the same
+prefixes:
+
+| Prefix | Meaning |
+| --- | --- |
+| `app >` | Host → adapter (ELM line, SLCAN command, BMW-FAST frame, J2534 RPC, raw K+DCAN bytes, …) |
+| `app <` | Adapter → host (formatted ELM reply, SLCAN frame line, echo/payload, RPC response, …) |
+| `bus tx` | Adapter → vehicle (K-Line/J1850 bytes or CAN id+DLC+data) |
+| `bus rx` | Vehicle → adapter (raw bus frame before host formatting) |
+
+ELM327 also logs hex OBD requests (not only `AT…`), and timeouts name the
+request (`NO DATA / TIMEOUT: 090A`). J2534 logs complete RPC payloads as
+`app > op=N` / `app < op=N` plus per-frame bus traffic.
 
 Run test suite:
 
@@ -104,6 +124,7 @@ Implemented and working:
 - Ediabas / Deep OBD DS2 mode and K+DCAN transparent UART mode
 - Sticky mode across disconnect; short-tap cycles modes; mode-coloured status LED
 - Board control: high-side/low-side drivers, boost converter, voltage sense, calibration
+- Shared debug-console IO tracing (`app >` / `app <` / `bus tx` / `bus rx`) across ELM327, SLCAN, J2534, Ediabas, and K+DCAN
 
 Not yet implemented:
 

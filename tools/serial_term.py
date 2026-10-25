@@ -39,6 +39,7 @@ RULES = [
     (re.compile(rb"^OK\b"), GREEN),
     (re.compile(rb"^rx ", re.I), CYAN),
     (re.compile(rb"^tx ", re.I), MAGENTA),
+    (re.compile(rb"(?:app|bus)\s*[><]|bus\s+(?:tx|rx)\b", re.I), CYAN),
     (re.compile(rb"^>"), CYAN),
     (re.compile(rb"^(?:[0-9A-F]{2} ){2}|^[tTrR][0-9A-F]{3,8}[0-8]", re.I), CYAN),
 ]

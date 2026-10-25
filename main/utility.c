@@ -1,7 +1,74 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 #include <ctype.h>
+#include <inttypes.h>
 #include <stdio.h>
+#include "can_frame.h"
+#include "esp_log.h"
 #include "esp_timer.h"
+#include "utility.h"
+
+/** Bytes shown on one console line before truncation. */
+#define LOG_IO_HEX_MAX 96
+
+void log_io_hex(const char *tag, const char *prefix, const uint8_t *data,
+                size_t len) {
+    char buf[LOG_IO_HEX_MAX * 3 + 1];
+    char *p = buf;
+    size_t n = len;
+
+    if (!prefix) {
+        prefix = "";
+    }
+    if (!data && len) {
+        ESP_LOGI(tag, "%s <null len=%u>", prefix, (unsigned)len);
+        return;
+    }
+    if (n > LOG_IO_HEX_MAX) {
+        n = LOG_IO_HEX_MAX;
+    }
+    for (size_t i = 0; i < n; i++) {
+        p += sprintf(p, "%02X%s", data[i], (i + 1 < n) ? " " : "");
+    }
+    *p = '\0';
+    if (len > n) {
+        ESP_LOGI(tag, "%s %s …(+%u)", prefix, buf, (unsigned)(len - n));
+    } else if (n == 0) {
+        ESP_LOGI(tag, "%s <empty>", prefix);
+    } else {
+        ESP_LOGI(tag, "%s %s", prefix, buf);
+    }
+}
+
+void log_io_text(const char *tag, const char *prefix, const char *text) {
+    if (!prefix) {
+        prefix = "";
+    }
+    ESP_LOGI(tag, "%s %s", prefix, text ? text : "");
+}
+
+void log_io_can(const char *tag, const char *prefix, uint32_t id, uint8_t dlc,
+                const uint8_t *data) {
+    char buf[8 * 3 + 1];
+    char *p = buf;
+
+    if (!prefix) {
+        prefix = "";
+    }
+    if (dlc > 8) {
+        dlc = 8;
+    }
+    for (uint8_t i = 0; i < dlc; i++) {
+        p += sprintf(p, "%02X%s", data[i], (i + 1 < dlc) ? " " : "");
+    }
+    *p = '\0';
+    if (id & CAN_EFF_FLAG) {
+        ESP_LOGI(tag, "%s id=%08" PRIX32 " dlc=%u %s", prefix,
+                 id & CAN_EFF_MASK, dlc, buf);
+    } else {
+        ESP_LOGI(tag, "%s id=%03" PRIX32 " dlc=%u %s", prefix,
+                 id & CAN_SFF_MASK, dlc, buf);
+    }
+}
 
 void hexdump(const void *data, size_t size) {
     const unsigned char *byte_data = (const unsigned char *)data;

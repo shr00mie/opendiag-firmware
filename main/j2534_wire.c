@@ -1,8 +1,12 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
+#include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "j2534.h"
+#include "utility.h"
+
+#define TAG "J2534"
 
 #define WIRE_MAGIC "J253"
 #define WIRE_MAGIC_SIZE 4u
@@ -159,9 +163,21 @@ static void process_frame(void) {
     }
 
     wire.assembling_request = false;
+    {
+        char prefix[24];
+
+        snprintf(prefix, sizeof(prefix), "app > op=%u", wire.operation);
+        log_io_hex(TAG, prefix, wire.request, wire.request_len);
+    }
     wire.response_len = j2534_core_request(wire.operation, wire.request,
                                            wire.request_len, wire.response);
     wire.response_ready = true;
+    {
+        char prefix[24];
+
+        snprintf(prefix, sizeof(prefix), "app < op=%u", wire.operation);
+        log_io_hex(TAG, prefix, wire.response, wire.response_len);
+    }
     send_response_fragment(0);
 }
 

@@ -2120,6 +2120,8 @@ static void elm327_print_can_frame(elm327_ctx_t *e, uint32_t id, uint8_t dlc,
         dlc = 8;
     }
 
+    log_io_can(TAG, "bus rx", id, dlc, data);
+
     if (e->settings.can_auto_format && !e->settings.show_header && dlc >= 1) {
         type = data[0] >> 4;
 
@@ -2187,6 +2189,10 @@ static void elm327_print_can_frame(elm327_ctx_t *e, uint32_t id, uint8_t dlc,
     *p++ = '\r';
     *p = '\0';
 
+    /* What the phone/app receives for this frame (ELM formatting applied). */
+    p[-1] = '\0';
+    log_io_text(TAG, "app <", outstr);
+    p[-1] = '\r';
     elm327_send_string(e, outstr);
 }
 
@@ -2605,6 +2611,7 @@ static int elm327_can_protocol_xfer(elm327_ctx_t *e, const uint8_t *frame,
 
     read_all_can(e);
 
+    log_io_can(TAG, "bus tx", tx_frame.id, tx_frame.dlc, tx_frame.data);
     ret = can_frame_send(&tx_frame);
     if (ret != 0) {
         ESP_LOGE(TAG, "Fail to send CAN frame ret=%d\n", ret);
@@ -3038,6 +3045,8 @@ static void elm327_print_j1850_kline_frame(elm327_ctx_t *e, const uint8_t *data,
     char *p = &outstr[0];
     size_t hdr = elm327_header_len(e, data, len);
 
+    log_io_hex(TAG, "bus rx", data, len);
+
     /* Headers off strips what the standard wraps the data in: the header at
      * the front and the checksum at the back. A frame with nothing left under
      * them is printed whole rather than emptied. */
@@ -3056,8 +3065,12 @@ static void elm327_print_j1850_kline_frame(elm327_ctx_t *e, const uint8_t *data,
         }
     }
     *p++ = '\r';
-    *p++ = '\0';
+    *p = '\0';
 
+    /* Temporarily hide the CR so the console line stays one line. */
+    p[-1] = '\0';
+    log_io_text(TAG, "app <", outstr);
+    p[-1] = '\r';
     elm327_send_string(e, outstr);
 }
 
@@ -3440,6 +3453,7 @@ static int elm327_bus_xfer(elm327_ctx_t *e, const uint8_t *frame, size_t len,
         tx_flags = BUS_TX_CLEAR_RX_QUEUE;
     }
     bus_msg_tx(&tx_msg, tx_frame, tx_len, 0);
+    log_io_hex(TAG, "bus tx", tx_frame, tx_len);
     ret = vif_bus_send(VIF_OWNER_LINK, elm327_bus(e), &tx_msg, tx_flags);
     if (ret != 0) {
         ESP_LOGE(TAG, "Fail to send frame ret=%d", ret);
@@ -3512,7 +3526,7 @@ static int elm327_bus_xfer(elm327_ctx_t *e, const uint8_t *frame, size_t len,
     elm327_bus_settle(e, cap, settle_ms, window);
 
     if (frame_counter == 0) {
-        ESP_LOGE(TAG, "NO DATA / TIMEOUT");
+        /* Logged with the request string in elm327_parse_command. */
         return -1;
     }
     return 0;
@@ -3745,10 +3759,10 @@ static void elm327_parse_command(elm327_ctx_t *e, const char *cmd) {
     int rc;
     uint8_t frame[8] = {0};
 
-    if (cmd[0] == 'A' && cmd[1] == 'T') {
-        /* AT commands */
-        ESP_LOGI(TAG, "Command: %s", cmd);
+    /* Raw client line (AT or hex OBD). Empty CR repeats land here too. */
+    log_io_text(TAG, "app >", cmd);
 
+    if (cmd[0] == 'A' && cmd[1] == 'T') {
         elm327_at_command_handler(e, &cmd[2]);
     } else {
         size_t len = strlen(cmd);
@@ -3774,11 +3788,11 @@ static void elm327_parse_command(elm327_ctx_t *e, const char *cmd) {
                      frame_len);
             elm327_send_string(e, "?\r");
         } else {
-        memset(e->last_obd_buf, 0, sizeof(e->last_obd_buf));
-        e->last_obd_len = frame_len > (int)sizeof(e->last_obd_buf)
-                              ? (uint8_t)sizeof(e->last_obd_buf)
-                              : (uint8_t)frame_len;
-        memcpy(e->last_obd_buf, frame, e->last_obd_len);
+            memset(e->last_obd_buf, 0, sizeof(e->last_obd_buf));
+            e->last_obd_len = frame_len > (int)sizeof(e->last_obd_buf)
+                                  ? (uint8_t)sizeof(e->last_obd_buf)
+                                  : (uint8_t)frame_len;
+            memcpy(e->last_obd_buf, frame, e->last_obd_len);
             rc = -2;
 
             if (e->settings.current_protocol == 0) {
@@ -3825,11 +3839,13 @@ static void elm327_parse_command(elm327_ctx_t *e, const char *cmd) {
             }
 
             if (rc == -1) {
+                ESP_LOGE(TAG, "NO DATA / TIMEOUT: %s", cmd);
                 elm327_send_string(e, "NO DATA\r");
             } else if (rc == -3) {
                 /* Already reported in full - a second line here would have
                  * the client seeing "BUS INIT: ...ERROR" followed by "?". */
             } else if (rc < 0) {
+                ESP_LOGE(TAG, "OBD request failed rc=%d: %s", rc, cmd);
                 elm327_send_string(e, "?\r");
             }
         }

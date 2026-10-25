@@ -14,6 +14,7 @@
 #include "bus.h"
 #include "ds2_codec.h"
 #include "ediabas_bmwfast.h"
+#include "utility.h"
 #include "vif.h"
 
 #define TAG "EDIABAS"
@@ -66,6 +67,7 @@ static void ediabas_host_write_raw(const uint8_t *data, size_t len) {
     if (!data || !len) {
         return;
     }
+    log_io_hex(TAG, "app <", data, len);
     if (!g_ed.escape_mode_send) {
         vif_link_write(data, len);
         return;
@@ -365,6 +367,7 @@ static void ediabas_kline_xfer(const uint8_t *payload, size_t payload_len,
         return;
     }
 
+    log_io_hex(TAG, "bus tx", payload, payload_len);
     bus_msg_tx(&msg, payload, payload_len, 0);
     rc = vif_bus_send(VIF_OWNER_LINK, VIF_BUS_KLINE, &msg, BUS_TX_CLEAR_RX_QUEUE);
     if (rc != 0) {
@@ -377,6 +380,7 @@ static void ediabas_kline_xfer(const uint8_t *payload, size_t payload_len,
     while ((int32_t)(deadline - xTaskGetTickCount()) > 0) {
         rc = vif_bus_recv(VIF_OWNER_LINK, VIF_BUS_KLINE, &msg, pdMS_TO_TICKS(20));
         if (rc > 0 && msg.len > 0) {
+            log_io_hex(TAG, "bus rx", msg.data, msg.len);
             ediabas_host_write_raw(msg.data, msg.len);
             ediabas_host_flush();
             return;
@@ -516,6 +520,7 @@ static void ediabas_fe_feed(const uint8_t *data, size_t len) {
             g_ed.rx_len = 0;
             continue;
         }
+        log_io_hex(TAG, "app >", g_ed.rx, g_ed.rx_len);
         ediabas_handle_frame(g_ed.rx, g_ed.rx_len);
         g_ed.rx_len = 0;
     }
